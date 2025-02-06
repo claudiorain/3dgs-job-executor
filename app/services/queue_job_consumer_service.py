@@ -12,23 +12,19 @@ class QueueJobService:
         self.connection = get_connection()
         self.channel = get_channel(self.connection)
 
-    def process_job(ch, method, properties, body):
+    def process_job(self,ch, method, properties, body):
         print(f"Processing job: {body.decode()}")
         # Aggiungi qui la logica per eseguire il job
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     # Consuma i messaggi dalla coda
-    def consume_jobs():
-        channel = connect_to_rabbitmq()
+    def consume_jobs(self):
         
-        # Assicurati che la coda esista
-        channel.queue_declare(queue='3dgs')
-
         # Inizia a consumare dalla coda 'job_queue'
-        channel.basic_consume(queue='3dgs', on_message_callback=process_job)
+        self.channel.basic_consume(queue='3dgs', on_message_callback=self.process_job)
 
         print(' [*] Waiting for messages. To exit press CTRL+C')
-        channel.start_consuming()
+        self.channel.start_consuming()
 
         
 
