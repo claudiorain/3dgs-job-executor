@@ -1,11 +1,6 @@
-from uuid import uuid4
 from uuid import UUID
-from datetime import datetime
-from app.config.db import get_database  # Assicurati che questa funzione restituisca il client del database
-from app.models.model import ModelResponse  # Assumendo che il tuo modello sia in models.py
-from typing import List, Optional
-from pymongo import ASCENDING, DESCENDING
-from app.models.model import ModelCreateRequest  # Assumendo che il tuo modello sia in models.py
+from config.db import get_database  # Assicurati che questa funzione restituisca il client del database
+from models.model import ModelResponse  # Assumendo che il tuo modello sia in models.py
 
 # Configurazione MongoDB
 

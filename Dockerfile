@@ -1,16 +1,13 @@
 FROM python:3.9
 
-# Imposta la directory di lavoro all'interno del container
-WORKDIR /app
+WORKDIR /code
 
-# Copia i requisiti del progetto nella directory di lavoro
 COPY requirements.txt .
-
-# Installa le dipendenze Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia tutto il resto del codice sorgente nel container
+# Copia l'intera directory del progetto
 COPY . .
+ENV PYTHONUNBUFFERED=1
 
-# Comando per avviare il job-executor (sostituisci con il comando giusto per il tuo progetto)
-CMD ["python", "main.py"]
+
+CMD ["python", "-u", "main.py"]
