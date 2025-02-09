@@ -5,7 +5,7 @@ from datetime import datetime
 
 class ModelResponse(BaseModel):
     id: str = Field(alias='_id')
-    video_url: HttpUrl
+    video_url: str
     model_name: str
     model_folder_url: str
     status: str

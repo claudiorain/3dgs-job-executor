@@ -2,3 +2,5 @@ pydantic>=2.7.0,<3.0.0
 pymongo==4.9.0
 pika
 boto3
+requests
+opencv-python
