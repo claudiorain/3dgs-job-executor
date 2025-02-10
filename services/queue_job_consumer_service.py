@@ -8,6 +8,7 @@ import json
 import asyncio
 import requests
 import cv2
+import shutil
 
 model_service = ModelService()
 repository_service = RepositoryService()
@@ -54,26 +55,44 @@ class QueueJobService:
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
         
-        video_url = model.video_url
-        if not video_url:
-            print(f"Errore: Nessun video_url trovato per model_id {model_id}")
+        filename = model.filename
+        if not filename:
+            print(f"Errore: Nessun filename trovato per model_id {model_id}")
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
         
-        print("WORKING DIR: " + WORKING_DIR)
 
-        video_file_path = os.path.join(WORKING_DIR, f"{model_id}.mp4")
+        model_dir = os.path.join(WORKING_DIR, f"{model_id}")
 
-        repository_service.download(video_url,video_file_path)
+        print("WORKING DIR: " + model_dir)
+
+        video_file_path = os.path.join(model_dir, "video.mp4")
+
+        repository_service.download(filename,video_file_path)
         
         # Estraggo tot frames nella cartella input sotto WORKING_DIR
-        output_folder = os.path.join(WORKING_DIR, 'input')  # La cartella dove salvare le immagini estratte
+        frames_output_folder = os.path.join(model_dir, 'input')  # La cartella dove salvare le immagini estratte
 
-        self.extract_frames(video_file_path, output_folder)
+        self.extract_frames(video_file_path, frames_output_folder)
         
         # Chiamata API a Gaussian Splatting
-        payload = {"target_dir": WORKING_DIR}
-        response = requests.post(GAUSSIAN_SPLATTING_API_URL + "/convert", json=payload)
+        convert_request = {"input_dir": model_dir}
+        requests.post(GAUSSIAN_SPLATTING_API_URL + "/convert", json=convert_request)
+
+        # Estraggo tot frames nella cartella input sotto WORKING_DIR
+        train_output_folder = os.path.join(model_dir, 'output')  # La cartella dove salvare le immagini estratte
+        # Chiamata API a Gaussian Splatting
+        train_request = {"input_dir": model_dir,"output_dir": train_output_folder}
+        requests.post(GAUSSIAN_SPLATTING_API_URL + "/train", json=train_request)
+
+         # 📌 **Zippa la cartella output**
+        zip_filename = os.path.join(model_dir, "3d_model.zip")
+        shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', train_output_folder)
+
+        # 📌 **Carica lo ZIP su S3**
+        s3_key = f"{model_id}/3d_model.zip"
+        repository_service.upload(zip_filename, s3_key)
+
         #os.system(f"docker exec gaussian-splatting-image python convert.py s {WORKING_DIR}")
 
         ch.basic_ack(delivery_tag=method.delivery_tag)

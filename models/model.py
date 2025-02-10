@@ -5,16 +5,16 @@ from datetime import datetime
 
 class ModelResponse(BaseModel):
     id: str = Field(alias='_id')
-    video_url: str
+    filename: str
     model_name: str
-    model_folder_url: str
+    model_output_path: str
     status: str
     created_at: datetime
     updated_at: datetime
 
 # Modello dati
 class ModelCreateRequest(BaseModel):
-    video_url: str  
+    filename: str  
     model_name: str
 
     class Config:
