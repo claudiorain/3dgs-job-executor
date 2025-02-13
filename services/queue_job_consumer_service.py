@@ -4,6 +4,7 @@ from config.message_queue import close_connection  # Assicurati che questa funzi
 from services.model_service import ModelService
 from services.repository_service import RepositoryService
 import os
+import sys
 import json
 import asyncio
 import requests
@@ -68,7 +69,7 @@ class QueueJobService:
 
         video_file_path = os.path.join(model_dir, "video.mp4")
 
-        repository_service.download(filename,video_file_path)
+        repository_service.download(model.video_uri,video_file_path)
         
         # Estraggo tot frames nella cartella input sotto WORKING_DIR
         frames_output_folder = os.path.join(model_dir, 'input')  # La cartella dove salvare le immagini estratte
