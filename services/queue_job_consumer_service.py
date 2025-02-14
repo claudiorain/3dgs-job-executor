@@ -37,10 +37,9 @@ class QueueJobService:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.process_job_exec(ch, method, properties, body))
 
-    async def process_job_exec(self,ch, method, properties, body):
+    async def process_job_exec(self, ch, method, properties, body):
         data = json.loads(body.decode())
         print(f"Processing job: {data}")        
-        # Prendo l'id del documento (Mongo)
         model_id = data.get("model_id")
 
         if not model_id:
@@ -49,54 +48,77 @@ class QueueJobService:
             return
         
         # Passo 1: Leggere il documento da MongoDB
-        model = await model_service.get_model_by_id(model_id)
+        model = model_service.get_model_by_id(model_id)
 
         if not model:
             print(f"Errore: Nessun documento trovato per model_id {model_id}")
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
         
-        filename = model.filename
-        if not filename:
-            print(f"Errore: Nessun filename trovato per model_id {model_id}")
+        video_uri = model.video_uri
+        if not video_uri:
+            print(f"Errore: Nessun video_uri trovato per model_id {model_id}")
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
+
+        # Aggiorna stato "VIDEO_PROCESSING" mentre il video viene processato
+        model_service.update_model_status(model_id, {"status": "VIDEO_PROCESSING"})
+
+        try:
+            # Passo 2: Creazione delle cartelle di lavoro e download del video
+            model_dir = os.path.join(WORKING_DIR, f"{model_id}")
+            os.makedirs(model_dir, exist_ok=True)
+
+            video_file_path = os.path.join(model_dir, "video.mp4")
+            repository_service.download(model.video_uri, video_file_path)
+
+            # Estrarre fotogrammi dal video
+            frames_output_folder = os.path.join(model_dir, 'input')
+            self.extract_frames(video_file_path, frames_output_folder)
+
+            # Chiamata API a Gaussian Splatting
+            convert_request = {"input_dir": model_dir}
+            response = requests.post(GAUSSIAN_SPLATTING_API_URL + "/convert", json=convert_request)
+            if response.status_code != 200:
+                print(f"Errore durante la conversione: {response.text}")
+                return
+
+            model_service.update_model_status(model_id, {"status": "MODEL_TRAINING"})
+
+            # Chiamata API per il training del modello
+            train_output_folder = os.path.join(model_dir, 'output')
+            train_request = {"input_dir": model_dir, "output_dir": train_output_folder}
+            response = requests.post(GAUSSIAN_SPLATTING_API_URL + "/train", json=train_request)
+            if response.status_code != 200:
+                print(f"Errore durante il training: {response.text}")
+                return
+
+            # Zippa la cartella output
+            zip_filename = os.path.join(model_dir, "3d_model.zip")
+            shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', train_output_folder)
+
+            # Carica lo ZIP su S3
+            s3_key = f"models/{model_id}/3d_model.zip"
+            try:
+                repository_service.upload(zip_filename, s3_key)
+            except Exception as e:
+                print(f"Errore durante l'upload su S3: {e}")
+                # Se l'upload fallisce, metti lo stato in "FAILED" o altro per segnalarlo
+                model_service.update_model_status(model_id, {"status": "FAILED"})
+                return
+
+            # Aggiorna lo stato del modello nel database come "COMPLETED"
+            model_service.update_model_status(model_id, {"status": "COMPLETED", "output_path": s3_key})
+            
+        except Exception as e:
+            print(f"Errore durante il processamento del job: {e}")
+            # Aggiungi qui eventuali azioni correttive (log, retry, ecc.)
+            model_service.update_model_status(model_id, {"status": "FAILED"})
         
-
-        model_dir = os.path.join(WORKING_DIR, f"{model_id}")
-
-        print("WORKING DIR: " + model_dir)
-
-        video_file_path = os.path.join(model_dir, "video.mp4")
-
-        repository_service.download(model.video_uri,video_file_path)
-        
-        # Estraggo tot frames nella cartella input sotto WORKING_DIR
-        frames_output_folder = os.path.join(model_dir, 'input')  # La cartella dove salvare le immagini estratte
-
-        self.extract_frames(video_file_path, frames_output_folder)
-        
-        # Chiamata API a Gaussian Splatting
-        convert_request = {"input_dir": model_dir}
-        requests.post(GAUSSIAN_SPLATTING_API_URL + "/convert", json=convert_request)
-
-        # Estraggo tot frames nella cartella input sotto WORKING_DIR
-        train_output_folder = os.path.join(model_dir, 'output')  # La cartella dove salvare le immagini estratte
-        # Chiamata API a Gaussian Splatting
-        train_request = {"input_dir": model_dir,"output_dir": train_output_folder}
-        requests.post(GAUSSIAN_SPLATTING_API_URL + "/train", json=train_request)
-
-         # 📌 **Zippa la cartella output**
-        zip_filename = os.path.join(model_dir, "3d_model.zip")
-        shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', train_output_folder)
-
-        # 📌 **Carica lo ZIP su S3**
-        s3_key = f"{model_id}/3d_model.zip"
-        repository_service.upload(zip_filename, s3_key)
-
-        #os.system(f"docker exec gaussian-splatting-image python convert.py s {WORKING_DIR}")
-
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        finally:
+            # Questa parte verrà sempre eseguita, anche se c'è stata un'eccezione
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            print("Job completato o fallito, conferma del messaggio alla coda.")
 
     # Consuma i messaggi dalla coda
     def consume_jobs(self):
