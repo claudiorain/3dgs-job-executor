@@ -74,7 +74,7 @@ class QueueJobService:
 
             # Estrarre fotogrammi dal video
             frames_output_folder = os.path.join(model_dir, 'input')
-            self.extract_frames(video_file_path, frames_output_folder)
+            thumbnail_path = self.extract_frames(video_file_path, frames_output_folder)
 
             # Chiamata API a Gaussian Splatting
             convert_request = {"input_dir": model_dir}
@@ -107,18 +107,35 @@ class QueueJobService:
                 model_service.update_model_status(model_id, {"status": "FAILED"})
                 return
 
-            # Aggiorna lo stato del modello nel database come "COMPLETED"
-            model_service.update_model_status(model_id, {"status": "COMPLETED", "output_path": s3_key})
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                thumbnail_s3_key = f"models/{model_id}/thumbnail.jpg"
+    
+            thumbnail_s3_key = None
+
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                try:
+                    thumbnail_s3_key = f"models/{model_id}/thumbnail.jpg"
+                    repository_service.upload(thumbnail_path, thumbnail_s3_key)
+                    print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
+                except Exception as e:
+                    print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
+                    thumbnail_s3_key = None  # Se l'upload fallisce, non salviamo l'URL errato
+
+            # 🔹 Sempre aggiorniamo lo stato con entrambi i percorsi
+            update_data = {
+                "status": "COMPLETED",
+                "output_s3_key": s3_key
+            }
+
+            if thumbnail_s3_key:
+                update_data["thumbnail_s3_key"] = thumbnail_s3_key
+
+            model_service.update_model_status(model_id, update_data)
             
-        except Exception as e:
-            print(f"Errore durante il processamento del job: {e}")
-            # Aggiungi qui eventuali azioni correttive (log, retry, ecc.)
-            model_service.update_model_status(model_id, {"status": "FAILED"})
-        
         finally:
-            # Questa parte verrà sempre eseguita, anche se c'è stata un'eccezione
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            print("Job completato o fallito, conferma del messaggio alla coda.")
+                # Questa parte verrà sempre eseguita, anche se c'è stata un'eccezione
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                print("Job completato o fallito, conferma del messaggio alla coda.")
 
     # Consuma i messaggi dalla coda
     def consume_jobs(self):
@@ -131,49 +148,49 @@ class QueueJobService:
 
         
     # Funzione per estrarre 120 immagini dal video
-    def extract_frames(self,video_path, output_folder, total_frames=120):
-        """Estrae un numero specifico di fotogrammi da un video e li salva in una directory."""
-
-   
-        # Ora crea la cartella in sicurezza
+    def extract_frames(self, video_path, output_folder, total_frames=120):
+        """Estrae fotogrammi da un video e salva il primo frame separatamente."""
+    
         os.makedirs(output_folder, exist_ok=True)
-
-        # Apre il video
         cap = cv2.VideoCapture(video_path)
 
         if not cap.isOpened():
             print(f"Errore: Impossibile aprire il video {video_path}")
-            return
-        
-        # Ottieni il numero totale di fotogrammi nel video
+            return None  # Se il video non si apre, ritorna None
+
         total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Calcola l'intervallo di frame da estrarre
-        frame_interval = total_video_frames // total_frames
-        
-        # Estrai i fotogrammi
+        frame_interval = max(1, total_video_frames // total_frames)  
+
         frame_count = 0
         extracted_count = 0
-        
+        first_frame_path = None  
+
         while True:
             ret, frame = cap.read()
-
             if not ret:
-                break  # Uscire se non ci sono più fotogrammi
-            
-            # Se il frame è uno dei frame desiderati, lo salviamo
+                break  
+
             if frame_count % frame_interval == 0:
                 image_filename = os.path.join(output_folder, f"frame_{extracted_count + 1}.jpg")
-                cv2.imwrite(image_filename, frame)  # Salva l'immagine
+                cv2.imwrite(image_filename, frame)  
                 extracted_count += 1
 
+                if first_frame_path is None:
+                    first_frame_path = image_filename  # Salva il primo frame estratto
+                
             frame_count += 1
-            
             if extracted_count >= total_frames:
-                break  # Se abbiamo estratto il numero di fotogrammi desiderato, interrompiamo
+                break  
 
         cap.release()
-        print(f"Estrazione completata. {extracted_count} fotogrammi salvati in {output_folder}")
+        
+        if first_frame_path:
+            print(f"✅ Primo frame salvato: {first_frame_path}")
+        else:
+            print("❌ Nessun frame salvato.")
+
+        return first_frame_path  # ✅ Restituisce il primo frame
+
 
     def handle_exit(self, signum, frame):
         """Gestisce la chiusura dell'applicazione"""

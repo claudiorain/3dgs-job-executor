@@ -29,8 +29,11 @@ class ModelService:
         return ModelResponse(
             _id=model['_id'],
             video_uri=model['video_uri'],
+            thumbnail_s3_key=model['thumbnail_s3_key'],
+            thumbnail_url = '',
             title=model['title'],
-            output_path=model['output_path'],
+            output_s3_key=model['output_s3_key'],
+            output_url = '',
             status=model['status'],
             created_at=model['created_at'],
             updated_at=model['updated_at']
