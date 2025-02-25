@@ -4,3 +4,4 @@ pika
 boto3
 requests
 opencv-python
+numpy
