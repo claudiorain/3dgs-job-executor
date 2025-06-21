@@ -1,6 +1,7 @@
 from config.s3 import get_client
-import os
 from botocore.exceptions import NoCredentialsError
+import hashlib
+import os
 
 S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 CACHE_DIR = "/app/cache_s3"  # 📌 Directory locale per la cache
@@ -11,22 +12,31 @@ class RepositoryService:
         os.makedirs(CACHE_DIR, exist_ok=True)  # 📌 Assicuriamoci che la cartella di cache esista
 
     def get_cache_path(self, s3_key):
-        """ Restituisce il percorso locale nella cache per un dato file """
-        return os.path.join(CACHE_DIR, s3_key.replace("/", "_"))
+        """Restituisce il percorso del file cache basato sulla chiave S3."""
+        # Usa la chiave S3 come parte del percorso di cache
+        video_hash = hashlib.sha256(s3_key.encode()).hexdigest()  # Calcola un hash univoco per la chiave S3
+        return os.path.join(CACHE_DIR, video_hash)
 
-    def download(self, s3_key, local_path):
-        """ Scarica un file da S3 solo se non è già presente in cache """
-        cache_path = self.get_cache_path(s3_key)
+    def download_or_cache_video(self, s3_key, local_video_path):
+        """Verifica se il video è già in cache, se no lo scarica da S3 e lo copia nella cache."""
+        
+        # Calcola la cache path basata sulla chiave S3
+        cache_path = self.get_cache_path(s3_key)  # Cache path usando la chiave S3
 
+        # Se il video è già presente nella cache, copialo nel percorso di elaborazione
         if os.path.exists(cache_path):
-            print(f"✅ Usando il file in cache: {cache_path}")
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            os.system(f"cp {cache_path} {local_path}")  # Copia il file dalla cache
+            print(f"✅ Video trovato nella cache, copiando {cache_path} a {local_video_path}")
+            os.system(f"cp {cache_path} {local_video_path}")
         else:
-            print(f"⬇️ Scaricamento del file {s3_key} da S3...")
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            self.client.download_file(S3_BUCKET, s3_key, local_path)
-            os.system(f"cp {local_path} {cache_path}")  # Salva 
+            print(f"⬇️ Scaricamento video da S3: {s3_key}")
+            # Scarica il video da S3
+            self.client.download_file(S3_BUCKET, s3_key, local_video_path)
+            # Copia il video scaricato nella cache per il futuro utilizzo
+            os.system(f"cp {local_video_path} {cache_path}")
+            
+        return local_video_path
+
+
 
     def upload(self, file_path, s3_key):
         """Carica un file su S3."""

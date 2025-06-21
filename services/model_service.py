@@ -25,12 +25,20 @@ class ModelService:
         if model is None:
             return None
 
+        # Estrai error_message in modo sicuro, se presente
+        error_message = model.get('error_message', None)
+         # Estrai error_message in modo sicuro, se presente
+        results = model.get('results', None)
         # Restituisci un oggetto del tipo ModelResponse
         return ModelResponse(
             _id=model['_id'],
-            video_uri=model['video_uri'],
+            video_s3_key=model['video_s3_key'],
             title=model['title'],
+            description=model['description'],
             status=model['status'],
+            engine=model['engine'],
+            error_message=error_message,
+            results=results,
             created_at=model['created_at'],
             updated_at=model['updated_at']
         )

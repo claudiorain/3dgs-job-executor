@@ -1,7 +1,9 @@
 pydantic>=2.7.0,<3.0.0
 pymongo==4.9.0
+plyfile
 pika
 boto3
 requests
-opencv-python
-numpy
+pymediainfo
+# numpy, scipy, scikit-learn, opencv-python gestiti dal Dockerfile
+# SAM2 gestito dal Dockerfile con fallback

@@ -18,7 +18,7 @@ def get_connection():
     parameters = pika.ConnectionParameters(hostname,
                                    port,
                                    '/',
-                                   credentials,heartbeat=0)
+                                   credentials,heartbeat=0,socket_timeout=None)
 
     connection = pika.BlockingConnection(parameters)
     return connection

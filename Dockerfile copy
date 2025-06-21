@@ -1,0 +1,34 @@
+FROM python:3.9
+
+# Installa librerie di sistema necessarie (incluse per SAM2)
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    ffmpeg \
+    git \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /code
+
+# Copia e installa requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia l'intera directory del progetto
+COPY . .
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV HF_HUB_CACHE=/code/.cache/huggingface
+ENV TORCH_HOME=/code/.cache/torch
+
+# Crea cache directories
+RUN mkdir -p /code/.cache/huggingface /code/.cache/torch
+
+# Comando di default
+CMD ["python", "-u", "main.py"]
