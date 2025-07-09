@@ -5,5 +5,7 @@ pika
 boto3
 requests
 pymediainfo
+sharp-frames
+
 # numpy, scipy, scikit-learn, opencv-python gestiti dal Dockerfile
 # SAM2 gestito dal Dockerfile con fallback

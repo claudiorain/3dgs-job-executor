@@ -19,6 +19,210 @@ class Image:
 
 class FrameExtractor:
 
+    def calculate_sharp_frames_params(self,video_path, quality_level='balanced'):
+        """
+        Calcola parametri ottimali per sharp-frames usando logica del FrameExtractor
+        """
+        frame_extractor = FrameExtractor()
+        
+        # 1. Ottieni info video + rotazione
+        cap = cv2.VideoCapture(video_path)
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / video_fps
+        cap.release()
+        
+        # 2. Usa le funzioni esistenti per rotazione
+        rotation_angle = frame_extractor._get_normalized_rotation(video_path)
+        
+        # 3. Calcola dimensioni considerando rotazione
+        width, height = original_width, original_height
+        if rotation_angle in [90, 270]:
+            width, height = height, width  # Swap per rotazione
+        
+        # 4. Calcola target width per sharp-frames
+        target_width = None
+        max_dimension = max(width, height)
+        if max_dimension > 1920:  # Serve downscale
+            scale_factor = 1920 / max_dimension
+            target_width = int(width * scale_factor)
+        
+        # 5. Calcola fps basato su durata video e qualità
+        target_frames_map = {
+            'fast': 60,
+            'balanced': 120,
+            'quality': 180,
+            'ultra': 240
+        }
+        
+        target_frames = target_frames_map[quality_level]
+        extraction_fps = target_frames / duration
+        
+        # Cap al fps originale del video
+        extraction_fps = min(extraction_fps, video_fps)
+        
+        # Minimo assoluto per evitare errori
+        extraction_fps = max(0.1, extraction_fps)
+        
+        return {
+            'width': target_width,
+            'fps': round(extraction_fps, 2)
+        }
+    
+    def get_target_width_from_video(self,video_path, target_max_size=1920):
+        """
+        Analizza un video e restituisce la width target per sharp-frames-python
+        
+        Args:
+            video_path: Percorso del file video
+            target_max_size: Dimensione massima target (default 1920 per Full HD)
+        
+        Returns:
+            int: Width target per --width parameter, o None se no resize needed
+        """
+        try:
+            # Apri il video
+            cap = cv2.VideoCapture(video_path)
+            
+            # Ottieni dimensioni
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Chiudi il video
+            cap.release()
+            
+            # Calcola target width
+            max_dim = max(width, height)
+            
+            # Se già sotto target, non serve resize
+            if max_dim <= target_max_size:
+                return None
+            
+            # Calcola scale factor e target width
+            scale_factor = target_max_size / max_dim
+            target_width = int(width * scale_factor)
+            
+            return target_width
+        
+        except Exception as e:
+            print(f"Errore nell'analisi del video {video_path}: {e}")
+            return None
+        
+    def estimate_rotation_from_flow(self,prev_gray, curr_gray):
+        """
+        Stima rotazione camera da optical flow
+        """
+        # Rileva feature points
+        corners = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, 
+                                        qualityLevel=0.01, minDistance=10)
+        
+        if corners is None or len(corners) < 10:
+            return 0.0
+        
+        # Calcola optical flow
+        next_corners, status, error = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, corners, None)
+        
+        # Filtra punti validi
+        good_old = corners[status == 1]
+        good_new = next_corners[status == 1]
+        
+        if len(good_old) < 10:
+            return 0.0
+        
+        # Calcola movimento medio orizzontale (rotation indicator)
+        horizontal_movement = np.mean(good_new[:, 0] - good_old[:, 0])
+        
+        # Converti in gradi (euristica)
+        image_width = prev_gray.shape[1]
+        # Assumi FOV ~60° per smartphone
+        degrees_per_pixel = 60.0 / image_width
+        rotation_degrees = abs(horizontal_movement * degrees_per_pixel)
+        
+        return rotation_degrees
+    
+    def analyze_camera_rotation(self,video_path, sample_count=10):
+        """
+        Analisi rotazione semplificata
+        """
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        frame_indices = np.linspace(0, frame_count-1, sample_count, dtype=int)
+        
+        rotations = []
+        prev_gray = None
+        
+        for frame_idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret: continue
+            
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            if prev_gray is not None:
+                # ✅ Passa entrambi i frame
+                rotation = self.estimate_rotation_from_flow(prev_gray, gray)
+                rotations.append(rotation)
+            
+            prev_gray = gray
+        
+        cap.release()
+        
+        if not rotations:
+            return 6.0  # Fallback
+        
+        # Calcola velocità rotazione
+        frames_between_samples = frame_count / sample_count
+        time_between_samples = frames_between_samples / fps
+        avg_rotation_per_sample = np.mean(rotations)
+        
+        return avg_rotation_per_sample / time_between_samples
+
+    
+
+    def calculate_fps_for_colmap_overlap(self,video_path, target_overlap=0.7):
+        """
+        Calcola FPS per garantire 60-80% overlap tra frame consecutivi
+        """
+        # Analizza movimento camera (rotation speed)
+        rotation_speed = self.analyze_camera_rotation(video_path)  # degrees/second
+        
+        # Per 70% overlap in scene 360°:
+        # Ogni frame deve vedere ~70% della scena del precedente
+        # → Movimento massimo = 30% del FOV tra frame consecutivi
+        
+        camera_fov = 60  # gradi (typical smartphone)
+        max_rotation_per_frame = camera_fov * (1 - target_overlap)  # ~18 gradi
+        
+        # FPS necessario
+        required_fps = rotation_speed / max_rotation_per_frame
+        
+        return min(required_fps, 30)  # Cap a 30fps max
+    
+    def calculate_gaussian_splatting_fps(self,video_analysis, quality_level='balanced'):
+        """
+        FPS ottimale per Gaussian Splatting considerando COLMAP overlap
+        """
+        
+        # Base: garantire overlap COLMAP
+        min_fps_for_overlap = self.calculate_fps_for_colmap_overlap(video_analysis)
+        
+        # Quality multipliers per coverage extra
+        quality_multipliers = {
+            'fast': 0.8,     # Meno denso ma ancora >60% overlap
+            'balanced': 1.0, # Overlap ottimale ~70%
+            'quality': 1.3,  # Overlap maggiore ~80%
+            'ultra': 1.6     # Coverage ultra-densa ~85%
+        }
+        
+        target_fps = min_fps_for_overlap * quality_multipliers[quality_level]
+    
+        return round(target_fps, 1)
+    
     def _calculate_downscaled_dimensions(self, original_width, original_height,
                                         downscale_factor, auto_downscale_to_fhd):
         """

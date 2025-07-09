@@ -52,6 +52,7 @@ RUN cd /code/models && \
     wget -O sam2_hiera_base_plus.pt \
         https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt
 
+
 # Variabili d'ambiente
 ENV GROUNDING_DINO_CONFIG_PATH=/code/models/GroundingDINO_SwinT_OGC.py
 ENV GROUNDING_DINO_CHECKPOINT_PATH=/code/models/groundingdino_swint_ogc.pth

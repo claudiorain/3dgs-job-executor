@@ -1,38 +1,47 @@
 from config.message_queue import get_connection,get_channel,close_connection  # Assicurati che questa funzione restituisca il client del database
 from services.model_service import ModelService
 from services.repository_service import RepositoryService
+from services.training_params_service import TrainingParamsService,QualityLevel
 from utils.frame_extractor import FrameExtractor
-from utils.gaussian_estimator import GaussianEstimator
+from models.model import Engine
 from converters.ply_to_gsplat_converter import save_splat_file,process_ply_to_splat
-from utils.gaussian_frame_segmentator import segment_folder
-
+from datetime import datetime
+import subprocess
 import os
 import sys
 import json
-import asyncio
 import requests
 import shutil
-import threading
-import boto3
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 import tempfile
+import zipfile
+import re
 
 model_service = ModelService()
 repository_service = RepositoryService()
 frame_extractor = FrameExtractor()
-gaussian_estimator = GaussianEstimator()
+training_params_service = TrainingParamsService()
+
+
+
+# Cartella per i file di staging (zip delle fasi)
+S3_STAGING_PREFIX = os.getenv('S3_STAGING_PREFIX', 'staging')
+
+# Cartella per i deliverable finali
+S3_DELIVERY_PREFIX = os.getenv('S3_DELIVERY_PREFIX', 'delivery')
 
 WORKING_DIR = os.getenv("MODEL_WORKING_DIR") 
 GAUSSIAN_SPLATTING_API_URL = "http://gaussian-splatting-api:8050"
 COLMAP_API_URL = "http://colmap-converter-api:8060"
+
+POINT_CLOUD_BUILDING_PHASE_ZIP_NAME = "point_cloud_building_phase.zip"
+TRAINING_PHASE_ZIP_NAME = "training_phase.zip"
 
 # Creiamo la mappa che associa ciascun valore a un oggetto con api-url
 engine_map = {
     'INRIA': { 'api-url': 'http://gaussian-splatting-api:8100' },
     'MCMC': { 'api-url': 'http://3dgs-mcmc-api:8101' },
     'TAMING': { 'api-url': 'http://taming-3dgs-api:8102' },
-    'GSPLAT-INRIA': { 'api-url': 'http://nerfstudio-gsplat-api:8103' },
-    'GSPLAT-MCMC': { 'api-url': 'http://nerfstudio-gsplat-api:8103' }
 }
 
 # Assicurati che la cartella esista
@@ -45,322 +54,379 @@ class QueueJobService:
         self.connection = get_connection()
         self.channel = get_channel(self.connection)
 
-    async def download_and_process_video(self, ch, method, model_id, data):
+    def fail(self,model_id: str,phase_str : str,error_message: str):
+        print(error_message)
+        model_service.fail_phase(model_id, phase_str,error_message)
+        model_service.update_model_status(model_id, {"overall_status": "FAILED"})
+        
+    async def handle_frame_extraction(self, ch, method, model_id, data):
         """
         Fase 1: Download del video e creazione dei fotogrammi con preprocessing SAM2
         """
+        model_service.start_phase(model_id, "frame_extraction")
         model = model_service.get_model_by_id(model_id)
         if not model:
-            print(f"Errore: Nessun documento trovato per model_id {model_id}")
+            self.fail(model_id,"frame_extraction",f"Error: No model found for model_id {model_id}")
             return
                     
         video_s3_key = model.video_s3_key
         if not video_s3_key:
-            print(f"Errore: Nessun video_s3_key trovato per model_id {model_id}")
+            self.fail(model_id,"frame_extraction",f"Error: No video_s3_key found for model_id {model_id}")
             return
                     
-        model_service.update_model_status(model_id, {"status": "VIDEO_PROCESSING"})
-
         model_dir = os.path.join(WORKING_DIR, f"{model_id}")
         os.makedirs(model_dir, exist_ok=True)
 
-        # Crea una directory temporanea per scaricare il video
-        with tempfile.TemporaryDirectory() as temp_video_dir:
-            # Percorso del file video nella cache
-            local_video_path = os.path.join(temp_video_dir, 'video.mp4')
-
-            # Verifica se il video è già nella cache
-            repository_service.download_or_cache_video(video_s3_key, local_video_path)
-
-            # Calcola l'hash del video
-            video_hash = frame_extractor.generate_video_hash(local_video_path)
-
-            # Cartelle di lavoro per il video
-            processed_video_dir = os.path.join(os.path.join(WORKING_DIR, 'processed_videos'), video_hash)
-            frames_output_folder = os.path.join(processed_video_dir, 'input_orig')
+        # 🚀 RIMOZIONE TEMPFILE - Usa percorso fisso per sfruttare la cache
+        local_video_path = os.path.join(model_dir, 'input_video.mp4')
+        
+        try:
+            # Il repository_service.download() gestisce già la cache internamente!
+            # ✅ Se in cache: copia dalla cache al percorso locale
+            # ⬇️ Se non in cache: scarica da S3 e copia in cache
+            repository_service.download(video_s3_key, local_video_path)
             
-            # 🆕 Cartella per frames preprocessati
-            frames_preprocessed_folder = os.path.join(processed_video_dir, 'input_segmented')
+            frames_output_folder = os.path.join(model_dir, 'input')
+            
+            thumbnail_suffix = f"thumbnail.jpg"
+            thumbnail_s3_key = f"{S3_DELIVERY_PREFIX}/{model_id}/{thumbnail_suffix}"
+            
+            print(f"📽️ Processing video from: {local_video_path}")
+            
+            # Verifica che il video sia stato scaricato correttamente
+            if not os.path.exists(local_video_path):
+                raise Exception(f"Video file not found after download: {local_video_path}")
+            
+            video_size = os.path.getsize(local_video_path)
+            print(f"📊 Video size: {video_size / 1024 / 1024:.2f} MB")
+            
+            # Crea le cartelle necessarie
+            os.makedirs(frames_output_folder, exist_ok=True)
+                
+            # Calcola parametri ottimizzati
+            optimized_params = frame_extractor.calculate_sharp_frames_params(local_video_path)
+            print(f"Using FPS: {round(optimized_params['fps'])}")
+            print(f"Resizing images to: {optimized_params['width']}")
 
-            thumbnail_s3_key = f"models/{model_id}/thumbnail.jpg"
+            # 🆕 SHARP FRAMES CLI - Comando corretto
+            cmd = [
+                "sharp-frames",
+                local_video_path,
+                frames_output_folder,
+                "--selection-method", "batched",  # o "uniform"
+                "--fps" , "8"
+            ]
             
-            if os.path.exists(processed_video_dir):
-                print(f"Video già processato. Utilizzo i dati esistenti per l'hash: {video_hash}")
-                
-                # Controlla se abbiamo anche i frames preprocessati
-                if os.path.exists(frames_preprocessed_folder):
-                    print(f"✅ Frames preprocessati trovati nella cache")
-                    use_preprocessed = True
-                else:
-                    print(f"🔄 Cache trovata ma mancano frames preprocessati, rigenerazione...")
-                    use_preprocessed = False
-                    
-            else:
-                print(f"Video non trovato nella cache, elaborazione in corso...")
-                # Crea le cartelle necessarie
-                os.makedirs(processed_video_dir, exist_ok=True)
-                os.makedirs(frames_output_folder, exist_ok=True)
-                os.makedirs(frames_preprocessed_folder, exist_ok=True)
-                
-                # Procedi con il processamento del video e creazione dei fotogrammi
-                thumbnail_path = self.process_video(local_video_path, frames_output_folder)
-                
-                print(f"✅ Thumbnail local path: {thumbnail_path} and exists? " + str(os.path.exists(thumbnail_path)))
-                if thumbnail_path and os.path.exists(thumbnail_path):
-                    try:
-                        repository_service.upload(thumbnail_path, thumbnail_s3_key)
-                        print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
-                    except Exception as e:
-                        print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
-                        thumbnail_s3_key = None
-                
-                use_preprocessed = False
+            # Aggiungi --width solo se necessario
+            if optimized_params['width'] is not None:
+                cmd.extend(["--width", str(optimized_params['width'])])
+
+            print(f"🔧 Running: {' '.join(cmd)}")
             
-            # 🆕 PREPROCESSING DEI FRAMES CON SAM2
-            """if not use_preprocessed:
-                print(f"🤖 Avvio preprocessing frames con SAM2...")
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                print(f"✅ Sharp-frames completed successfully")
+                print(f"stdout: {result.stdout}")
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Sharp-frames failed with exit code {e.returncode}")
+                print(f"📝 stdout: {e.stdout}")
+                print(f"🔴 stderr: {e.stderr}")
                 
+                # Debug aggiuntivo
+                print(f"🔍 Video file exists: {os.path.exists(local_video_path)}")
+                print(f"🔍 Video file size: {os.path.getsize(local_video_path) if os.path.exists(local_video_path) else 'N/A'} bytes")
+                print(f"🔍 Output dir exists: {os.path.exists(frames_output_folder)}")
+                print(f"🔍 Output dir writable: {os.access(frames_output_folder, os.W_OK)}")
+        
+                raise Exception(f"Sharp-frames error: {e.stderr}")
+            
+            print(f"✅ Sharp Frames output: {result.stdout}")
+            if result.stderr:
+                print(f"⚠️ Sharp Frames warnings: {result.stderr}")       
+            
+            # Conta i frame estratti
+            frame_files = []
+            if os.path.exists(frames_output_folder):
+                for f in sorted(os.listdir(frames_output_folder)):
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        frame_files.append(os.path.join(frames_output_folder, f))
+            
+            frame_count = len(frame_files)
+            print(f"📊 Sharp frames extracted: {frame_count}")
+
+            # Gestione thumbnail
+            thumbnail_path = frame_files[0] if frame_files else None
+            print(f"✅ Thumbnail local path: {thumbnail_path} and exists? " + str(os.path.exists(thumbnail_path) if thumbnail_path else False))
+            
+            
+            if thumbnail_path and os.path.exists(thumbnail_path):
                 try:
-                    # Aggiorna status per indicare preprocessing in corso
-                    model_service.update_model_status(model_id, {
-                        "status": "FRAME_PREPROCESSING", 
-                        "thumbnail_s3_key": thumbnail_s3_key
-                    })
-                    
-                    # Segmentazione piante
-                    results = segment_folder(
-                        input_folder=frames_output_folder,
-                        output_folder=frames_preprocessed_folder,
-                        text_prompt=model.description,
-                        box_threshold=0.5,
-                        text_threshold=0.35,
-                        save_debug=False
-                    )
- 
-                    print(f"Successo: {results['successful']}/{results['total']}")
-
-                    # Se il preprocessing ha fallito su troppe immagini, usa frames originali
-                    success_rate = results['successful'] / results['total']
-                    if success_rate < 0.5:  # Meno del 50% successo
-                        print(f"⚠️  Tasso successo preprocessing troppo basso ({success_rate:.1%}), uso frames originali")
-                        frames_to_use = frames_output_folder
-                        preprocessing_used = False
-                    else:
-                        frames_to_use = frames_preprocessed_folder
-                        preprocessing_used = True
-                    
+                    repository_service.upload(thumbnail_path, thumbnail_s3_key)
+                    print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
                 except Exception as e:
-                    print(f"❌ Errore durante preprocessing: {e}")
-                    print(f"🔄 Fallback su frames originali")
-                    frames_to_use = frames_output_folder
-                    preprocessing_used = False
-                    
-                    # Log dell'errore nel modello
-                    model_service.update_model_status(model_id, {
-                        "preprocessing_error": str(e),
-                        "frames_preprocessed": False
-                    })
-            else:
-                # Usa frames preprocessati dalla cache
-                frames_to_use = frames_preprocessed_folder
-                preprocessing_used = True
-                print(f"✅ Utilizzo frames preprocessati dalla cache")
+                    print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
+                    thumbnail_s3_key = None
 
-            # 🆕 Aggiorna il path dei frames per il prossimo step
-            print(f"📁 Frames finali utilizzati: {frames_to_use}")
-            print(f"🎯 Preprocessing utilizzato: {preprocessing_used}")"""
+            # 📤 UPLOAD CARTELLA INPUT (FRAMES) SU S3
+            self.create_phase_zip_and_upload(model_id,model_dir,POINT_CLOUD_BUILDING_PHASE_ZIP_NAME,['input'])
 
-        frames_to_use = frames_output_folder
-        # Passa al prossimo job con informazioni aggiuntive
-        model_service.update_model_status(model_id, {
-            "status": "POINT_CLOUD_RECONSTRUCTION", 
-            "thumbnail_s3_key": thumbnail_s3_key,
-            "frames_path": frames_to_use,
-            "preprocessing_used": False
-        })
+
+            # ✅ COMPLETE FASE con metadata
+            phase_metadata = {
+                "frame_count": frame_count,
+                "video_local_path": local_video_path,  # Path del video per debug
+                "video_size_mb": video_size / 1024 / 1024 if 'video_size' in locals() else None,
+                "processing_params": {
+                    "outlier_window_size": 10,
+                    "outlier_sensitivity": 60,
+                    "selection_method": "outlier-removal",
+                    "fps": round(optimized_params['fps']),
+                    "width": optimized_params['width']
+                }
+            }
+
+            model_service.complete_phase(model_id, "frame_extraction", 
+                                    metadata=phase_metadata)
+            
+            # Aggiorna il modello con thumbnail
+            if thumbnail_suffix:
+                model_service.update_model_status(model_id, {
+                    "thumbnail_suffix": thumbnail_suffix  # ✅ A livello root del modello
+                })
+            
+            self.send_to_next_phase(model_id, "point_cloud_queue")
+            
+        except Exception as e:
+            print(f"❌ Error in frame extraction: {e}")
+            self.fail(model_id, "frame_extraction", f"Frame extraction failed: {e}")
+            return
         
-        self.send_to_next_phase(model_id, "point_cloud_queue", video_hash)
+        finally:
+            # 🧹 CLEANUP OPZIONALE - Rimuovi il video locale dopo il processing
+            # (mantieni solo se serve per debug, altrimenti risparmia spazio disco)
+            try:
+                if os.path.exists(local_video_path):
+                    os.remove(local_video_path)
+                    print(f"🧹 Cleaned up local video file: {local_video_path}")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not cleanup video file: {e}")
 
-    def get_preprocessing_config(self, model):
-        """
-        Ottieni configurazione preprocessing dal modello o usa defaults.
-        """
-        # Puoi personalizzare in base al modello o alle sue properties
-        default_config = {
-            "method": "center_point",  # o "auto_bbox" per rilevamento automatico
-            "removal_level": "moderate",  # conservative, moderate, aggressive
-            "transparent_bg": True,  # Raccomandato per Gaussian Splatting
-            "model_size": "base_plus"  # tiny, small, base_plus, large
-        }
-        
-        # Se il modello ha configurazioni specifiche, le usi
-        if hasattr(model, 'preprocessing_config') and model.preprocessing_config:
-            config = default_config.copy()
-            config.update(model.preprocessing_config)
-            return config
-        
-        return default_config
-
-    def process_video(self, local_video_path, frames_output_folder):
-        # Estrarre fotogrammi dal video
-        return  frame_extractor.extract_frames(local_video_path, frames_output_folder,
-                                                        threshold=0.40,
-                                                        min_contour_area=500,
-                                                        max_frames=200,  # Extract more frames for 360° scenes
-                                                        min_sharpness=100,
-                                                        enforce_temporal_distribution=True,
-                                                        downscale_factor=1)  # Pro
-
-    async def build_point_cloud(self, ch, method, model_id, data):
+    async def handle_point_cloud_building(self, ch, method, model_id, data):
         """Fase 2: Creazione del punto nuvola tramite Gaussian Splatting"""
-
-        video_hash = data.get("additional_data")
-        processed_video_dir = os.path.join(os.path.join(WORKING_DIR, 'processed_videos'), video_hash)
-        
-        # 🆕 Salva backup delle immagini segmentate PRIMA di COLMAP
-        input_dir = os.path.join(processed_video_dir, 'input')
-
-        print(f"✅ Input dir {input_dir} esiste!")
-        # Prepara directory input per COLMAP
-        self.prepare_input_directory(processed_video_dir)
-        
-        # Cartella sparse per la point cloud
-        sparse_dir = os.path.join(processed_video_dir, 'sparse')
-
-        if os.path.exists(sparse_dir):
-            print(f"Nuvola di punti già esistente per model_id {model_id}. Saltando la generazione.")
-        else:
-            print(f"Generando la nuvola di punti per model_id {model_id}...")
-            
-            # COLMAP API call
-            convert_request = {"input_dir": processed_video_dir}
-            response = requests.post(COLMAP_API_URL + "/convert", json=convert_request)
-            
-            if response.status_code != 200:
-                print(f"❌ Errore COLMAP: {response.text}")
-                return
-            
-            # 🆕 SOSTITUZIONE IMMEDIATA DOPO COLMAP
-            images_dir = os.path.join(processed_video_dir, 'images')
-            print(f"✅ Input dir {images_dir} esiste!")
-           
-            if not os.path.exists(sparse_dir):
-                print(f"Errore: la nuvola di punti non è stata creata correttamente per model_id {model_id}")
-                return
-            
-            print(f"Nuvola di punti generata con successo per model_id {model_id}.")
-
-        # Passa al prossimo job (model_training)
-        model_service.update_model_status(model_id, {"status": "MODEL_TRAINING"})
-
+        model_service.start_phase(model_id, "point_cloud_building")
         model = model_service.get_model_by_id(model_id)
         if not model:
-            print(f"Errore: Nessun documento trovato per model_id {model_id}")
+            self.fail(model_id,"point_cloud_building",f"Error: No model found for model_id {model_id}")
             return
         
-        self.send_to_next_phase(model_id, "model_training_queue", {"engine": model.engine, "input_dir": processed_video_dir})
+        # 🆕 Salva backup delle immagini segmentate PRIMA di COLMAP
+        model_dir = os.path.join(WORKING_DIR, f"{model_id}")
+        input_dir = os.path.join(model_dir, 'input')
 
-    
-    def prepare_input_directory(self, processed_video_dir):
-        """
-        Prepara SOLO la directory 'input/' per COLMAP.
-        Priorità: segmented > orig
-        Rimuove TUTTO il resto per evitare confusione.
-        """
-        import shutil
-        
-        segmented_dir = os.path.join(processed_video_dir, 'input_segmented')
-        orig_dir = os.path.join(processed_video_dir, 'input_orig')
-        input_dir = os.path.join(processed_video_dir, 'input')
-        
-        print(f"🔧 Preparazione input/ per COLMAP...")
-        
-        # Scegli la fonte migliore
-        if os.path.exists(segmented_dir):
-            source_dir = segmented_dir
-            frames_type = "segmentati"
-        elif os.path.exists(orig_dir):
-            source_dir = orig_dir
-            frames_type = "originali"
+        if os.path.exists(input_dir) and os.listdir(input_dir):
+            print(f"✅ Directory input già esistente per model_id {model_id}")
         else:
-            print(f"❌ Nessuna immagine trovata!")
-            return False
-        
-        print(f"📁 Usando frames {frames_type}")
-        
-        # Rinomina la directory scelta in 'input'
-        if os.path.exists(input_dir):
-            shutil.rmtree(input_dir)
-        shutil.move(source_dir, input_dir)
-        
-        # Rimuovi TUTTO il resto
-        for item in os.listdir(processed_video_dir):
-            if item == 'input':
-                continue
-            item_path = os.path.join(processed_video_dir, item)
-            if os.path.isdir(item_path):
-                print(f"🗑️  Rimozione {item}/")
-                shutil.rmtree(item_path)
-        
-        # Conta risultato
-        files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        print(f"✅ COLMAP userà {len(files)} immagini {frames_type}")
+            print(f"📥 Scaricando directory input da S3 per model_id {model_id}")
+            # Crea directory se non esiste
+            os.makedirs(model_dir, exist_ok=True)
 
-    async def train_model(self, ch, method, model_id, data):
-        print(f"start training model")
-        """Fase 3: Addestramento del modello"""
-        input_dir = data.get("additional_data").get("input_dir")
-        estimated_cap_max = gaussian_estimator.estimate_from_colmap(
-                input_dir, 
-                density_factor=6.0,
-                min_gaussians=300000,
-                max_gaussians=5000000
-            )
-    
-        print(f"estimated max gaussians " + str(estimated_cap_max))
+            # Ottieni il percorso S3 del ZIP della fase point cloud building
+            point_cloud_zip_s3_key = f"{S3_STAGING_PREFIX}/{model.parent_model_id}/{POINT_CLOUD_BUILDING_PHASE_ZIP_NAME}"
 
-        # Chiamata API per il training del modello
-        train_output_folder = os.path.join(os.path.join(WORKING_DIR, f"{model_id}"), 'output')
-    
-        engine = data.get("additional_data").get("engine")
+            # Scarica ed estrai lo ZIP
+            success = self.download_and_extract_phase_zip(point_cloud_zip_s3_key, model_dir)
 
-        train_request = {"input_dir": input_dir, "output_dir": train_output_folder, "cap_max": int(estimated_cap_max * 1.2),
-                        "train_type": {"GSPLAT-INRIA": "default", "GSPLAT-MCMC": "mcmc"}.get(engine, "default") }#, "cap_max":estimated_cap_max
-        response = requests.post(engine_map.get(engine).get('api-url') + "/train", json=train_request)
+            if not success:
+                self.fail(model_id, "point_cloud_building", 
+                         f"Failed to download/extract point cloud building ZIP from {point_cloud_zip_s3_key}")
+                return
+            
+             # Verifica nuovamente che l'estrazione sia andata a buon fine
+            if not os.path.exists(input_dir):
+                self.fail(model_id, "point_cloud_building", 
+                         f"Input directory is still invalid after ZIP extraction")
+                return
+           
+        # 2. Conta frame di input per metadata
+        frame_files = [f for f in os.listdir(input_dir) 
+                      if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        input_frame_count = len(frame_files)
+
+        # Cartella sparse per la point cloud
+        sparse_dir = os.path.join(model_dir, 'sparse')
+
+
+        print(f"Generando la nuvola di punti per model_id {model_id}...")
+            
+        print(f"🔄 Avvio generazione point cloud per model_id {model_id}...")
+        colmap_start_time = datetime.utcnow()
+        
+        # COLMAP API call
+        convert_request = {"input_dir": model_dir}
+        response = requests.post(COLMAP_API_URL + "/convert", json=convert_request)
+        
+        # ⏱️ FINE TIMING COLMAP
+        colmap_end_time = datetime.utcnow()
+        colmap_duration = colmap_end_time - colmap_start_time
+        colmap_duration_seconds = colmap_duration.total_seconds()
+            
         if response.status_code != 200:
-            print(f"Errore durante il training: {response.text}")
+            self.fail(model_id,"point_cloud_building",f" Colmap error: {response.text}")
             return
-        print(f"training ended")
+        
+        # 5. Verifica che COLMAP abbia creato i file
+        if not os.path.exists(sparse_dir) or not os.listdir(sparse_dir):
+            self.fail(model_id,"point_cloud_building",f"Error: no cloud point created for model_id {model_id}")
+            return   
+         
+        print(f"✅ Nuvola di punti generata con successo per model_id {model_id}")
 
-        # Passa al prossimo job (upload)
-        self.send_to_next_phase(model_id, "upload_queue", train_output_folder)
+        self.create_phase_zip_and_upload(model_id,model_dir,TRAINING_PHASE_ZIP_NAME,['sparse', 'images'])
+        
 
-    async def upload_model(self, ch, method, model_id, data):
-        """Fase 4: Caricamento del modello addestrato su S3"""
+        # 7. Aggiorna stato e passa alla fase successiva
+        phase_metadata = {
+            "input_frame_count": input_frame_count,
+            "colmap_duration_seconds": round(colmap_duration_seconds, 2),
+            "colmap_start_time": colmap_start_time.isoformat(),
+            "colmap_end_time": colmap_end_time.isoformat(),
+        }
+
+        model_service.complete_phase(model_id, "point_cloud_building", 
+                                   metadata=phase_metadata)
+    
+        self.send_to_next_phase(model_id, "model_training_queue")
+
+    async def handle_training(self, ch, method, model_id, data):
+        print(f"🚀 Start training model {model_id}")
+        
+        # ⏰ START FASE
+        model_service.start_phase(model_id, "training")
+        
         try:
             model = model_service.get_model_by_id(model_id)
+            if not model:
+                self.fail(model_id,"training",f"Error: No model found for model_id {model_id}")
+                return
+            
+            model_dir = os.path.join(WORKING_DIR, f"{model_id}")
+            image_dir = os.path.join(model_dir, "images")
+            sparse_dir = os.path.join(model_dir, "sparse")
+            
+            if os.path.exists(image_dir) and os.listdir(image_dir) and os.path.exists(sparse_dir) and os.listdir(sparse_dir):
+                print(f"✅ Directories images e sparse già esistenti per model_id {model_id}")
+            else:
+                print(f"📥 Scaricando directory input da S3 per model_id {model_id}")
+                # Crea directory se non esiste
+                os.makedirs(model_dir, exist_ok=True)
+
+                # Ottieni il percorso S3 del ZIP della fase point cloud building
+                training_zip_s3_key = f"{S3_STAGING_PREFIX}/{model.parent_model_id}/{TRAINING_PHASE_ZIP_NAME}"
+
+                # Scarica ed estrai lo ZIP
+                success = self.download_and_extract_phase_zip(training_zip_s3_key, model_dir)
+                if not success:
+                    self.fail(model_id, "training", 
+                            f"Failed to download/extract training ZIP from {training_zip_s3_key}")
+                    return
+
+            
+             # Verifica nuovamente che l'estrazione sia andata a buon fine
+            if not os.path.exists(image_dir)  or not os.path.exists(sparse_dir):
+                self.fail(model_id, "training", 
+                         f"Images or sparse directories are still invalid after ZIP extraction")
+                return
+            
+            
+            engine = model.training_config.get('engine') if model.training_config else None
+            quality_level = model.training_config.get('quality_level') if model.training_config else None
+            if not engine:
+                self.fail(model_id,"training",f"Error: No engine found in model {model_id}")
+                return
+            
+            # 3. Prepara directory di output
+            train_output_folder = os.path.join(model_dir, 'output')
+            os.makedirs(train_output_folder, exist_ok=True)
+            
+            generated_params = training_params_service.generate_params(Engine(engine),QualityLevel(quality_level))
+            # 4. Prepara richiesta di training
+            train_request = {
+                "input_dir": model_dir,
+                "output_dir": train_output_folder,
+                "params": generated_params.final_params,
+            }
+            
+            # 5. Chiamata API per il training
+            api_url = engine_map.get(engine, {}).get('api-url')
+            if not api_url:
+                self.fail(model_id,"training",f"Error: No api url found for engine {engine}")
+                return
+            
+            print(f"🎯 Starting training with engine: {engine}")
+            training_start_time = datetime.utcnow()
+        
+            # TRAIN API call
+            response = requests.post(f"{api_url}/train", json=train_request)
+            # ⏱️ FINE TIMING TRAIN
+            training_end_time = datetime.utcnow()
+            training_duration = training_end_time - training_start_time
+            training_duration_seconds = training_duration.total_seconds()
+            
+            if response.status_code != 200:
+                self.fail(model_id,"training",f"Error: Training failed status code {response.status_code}")
+                return
+            
+            print(f"✅ Training completato con successo")
+            
+            # Prima dell'upload
+            print(f"🔍 Output folder exists: {os.path.exists(train_output_folder)}")
+
+            # ✅ COMPLETE FASE
+            phase_metadata = {
+            "training_duration_seconds": round(training_duration_seconds, 2),
+            "training_start_time": training_start_time.isoformat(),
+            "training_end_time": training_end_time.isoformat(),
+            "training_parameters": {
+                "engine": engine
+            }
+        }
+
+            model_service.complete_phase(model_id, "training", 
+                                   metadata=phase_metadata)
+            # 8. Passa alla fase successiva
+            self.send_to_next_phase(model_id, "upload_queue")
+        
+        except Exception as e:
+            self.fail(model_id,"training",f"Training error: {e}")
+
+    async def handle_model_upload(self, ch, method, model_id, data):
+        """Fase 4: Caricamento del modello addestrato su S3"""
+
+        # ⏰ START FASE
+        model_service.start_phase(model_id, "upload")
+        
+        try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 # Crea i percorsi come al solito, ma per gsplat_path utilizziamo la cartella temporanea
                 model_dir = os.path.join(WORKING_DIR, f"{model_id}")
-                train_output_folder = data.get("additional_data")
+                
+                # 1. Verifica se sparse directory esiste (output di COLMAP)
+                output_dir = os.path.join(model_dir, 'output')
+                if not os.path.exists(output_dir):
+                    self.fail(model_id,"upload",f"No folder output found: {e}")
+                    return
 
-                if model.engine in ["INRIA","MCMC","TAMING"]:  # Gruppo 1: INRIA, TAMING scrivono in modo simile
-                    ply_path = os.path.join(train_output_folder, "point_cloud/iteration_30000/point_cloud.ply")
-                    cameras_file_path = os.path.join(train_output_folder, "cameras.json")
 
-                    # Usa la cartella temporanea per il file .splat
-                    gsplat_path = os.path.join(temp_dir, "point_cloud.splat")
-                    # Processa il file .ply e salva il .splat nella cartella temporanea
-                    save_splat_file(process_ply_to_splat(ply_path), gsplat_path)
+                ply_path = self.find_latest_iteration_folder(output_dir)
+                cameras_file_path = os.path.join(output_dir, "cameras.json")
 
-                    # Aggiungi il file cameras.json alla cartella temporanea
-                    shutil.copy(cameras_file_path, temp_dir)
-                elif model.engine in ["GSPLAT-INRIA", "GSPLAT-MCMC"]:
-                    ply_path = os.path.join(train_output_folder, "ply/point_cloud_29999.ply")
-                    # Usa la cartella temporanea per il file .splat
-                    gsplat_path = os.path.join(temp_dir, "point_cloud.splat")
-                    # Processa il file .ply e salva il .splat nella cartella temporanea
-                    save_splat_file(process_ply_to_splat(ply_path), gsplat_path)
+                # Usa la cartella temporanea per il file .splat
+                gsplat_path = os.path.join(temp_dir, "point_cloud.splat")
+                # Processa il file .ply e salva il .splat nella cartella temporanea
+                save_splat_file(process_ply_to_splat(ply_path), gsplat_path)
+
+                # Aggiungi il file cameras.json alla cartella temporanea
+                shutil.copy(cameras_file_path, temp_dir)
 
                 # Creazione del file ZIP che contiene il file .splat e il file cameras.json
                 zip_filename = os.path.join(model_dir, "3d_model.zip")
@@ -368,102 +434,336 @@ class QueueJobService:
 
                 # Inizio del caricamento del modello su S3
                 print(f"Inizio del caricamento del modello {model_id} su S3...")
-                s3_key = f"models/{model_id}/3d_model.zip"
+                zip_model_suffix = f"3d_model.zip"
+                zip_model_s3_key = f"{S3_DELIVERY_PREFIX}/{model_id}/{zip_model_suffix}"
+
                 try:
-                    repository_service.upload(zip_filename, s3_key)
-                    print(f"✅ Il modello {model_id} è stato caricato con successo su S3 nella chiave {s3_key}")
+                    repository_service.upload(zip_filename, zip_model_s3_key)
+                    print(f"✅ Il modello {model_id} è stato caricato con successo su S3 nella chiave {zip_model_s3_key}")
                 except Exception as e:
-                    print(f"Errore durante l'upload su S3: {e}")
-                    model_service.update_model_status(model_id, {"status": "FAILED"})
+                    self.fail(model_id,"upload",f"Errore durante l'upload su S3: {e}")
                     return
                 
-                model_service.update_model_status(model_id, {"status": "METRICS_GENERATION", "output_s3_key": s3_key})
-                print(f"Model {model_id} caricato su S3 con successo!")
+               
                 # Passa al prossimo job (upload)
-                self.send_to_next_phase(model_id, "metrics_generation_queue", train_output_folder)
+                model_service.complete_phase(model_id, "upload")
+
+                model_service.update_model_status(model_id, {"zip_model_suffix": zip_model_suffix})
+                print(f"Model {model_id} caricato su S3 con successo!")
+                self.send_to_next_phase(model_id, "metrics_generation_queue")
                 
         except FileNotFoundError as e:
-            print(f"❌ Errore: {e}")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": str(e)})
+            self.fail(model_id,"upload",f"Error: {e}")
         except NoCredentialsError:
-            print("❌ Errore: Credenziali AWS mancanti.")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": "AWS credentials missing"})
+            self.fail(model_id,"upload","Error: AWS credential not found.")
         except PartialCredentialsError:
-            print("❌ Errore: Credenziali AWS parziali.")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": "Partial AWS credentials"})
+            self.fail(model_id,"upload","Error: AWS credential partially not found")
         except Exception as e:
-            print(f"❌ Errore durante il caricamento del modello: {e}")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": str(e)})
+            self.fail(model_id,"upload",f"Fail to upload model: {e}")
         
-    async def generate_metrics(self, ch, method, model_id, data):
+    def find_latest_iteration_folder(self,output_dir):
+        """Trova la cartella iteration_XXXXX con il numero più alto"""
+        point_cloud_dir = os.path.join(output_dir, "point_cloud")
+        
+        if not os.path.exists(point_cloud_dir):
+            return None
+        
+        # Pattern per cartelle iteration_NUMERO
+        iteration_pattern = re.compile(r'^iteration_(\d+)$')
+        max_iteration = -1
+        latest_folder = None
+        
+        for folder_name in os.listdir(point_cloud_dir):
+            match = iteration_pattern.match(folder_name)
+            if match:
+                iteration_num = int(match.group(1))
+                if iteration_num > max_iteration:
+                    max_iteration = iteration_num
+                    latest_folder = folder_name
+        
+        if latest_folder:
+            ply_path = os.path.join(point_cloud_dir, latest_folder, "point_cloud.ply")
+            print(f"🎯 Latest iteration folder: {latest_folder}")
+            print(f"📄 Expected PLY path: {ply_path}")
+            
+            if os.path.exists(ply_path):
+                file_size = os.path.getsize(ply_path)
+                print(f"✅ PLY file found: {file_size} bytes")
+                return ply_path
+            else:
+                print(f"❌ PLY file doesn't exist at: {ply_path}")
+                return None
+        else:
+            print(f"❌ No iteration folders found")
+            return None
+        
+    async def handle_metrics_generation(self, ch, method, model_id, data):
         """Fase 5: Generazione delle metriche e salvataggio su Mongo"""
-        # Aggiorna lo stato del modello a COMPLETED
+         # ⏰ START FASE
+        model_service.start_phase(model_id, "metrics_evaluation")
+        
         try:
             model = model_service.get_model_by_id(model_id)
-
-            train_output_folder = data.get("additional_data")
-            ssim = None
-            psnr = None
-            lpips = None
-            if model.engine in ["INRIA","MCMC","TAMING"]:  # Gruppo 1: INRIA, TAMING scrivono in modo simile
-                render_request = { "output_dir": train_output_folder}
-                response = requests.post(engine_map.get(model.engine).get('api-url') + "/render", json=render_request)
-                response.raise_for_status()  # Controlla che non ci siano errori nel render
-
-                metrics_request = { "output_dir": train_output_folder}
-                response = requests.post(engine_map.get(model.engine).get('api-url') + "/metrics", json=metrics_request)
-                response.raise_for_status()  # Controlla che non ci siano errori nel render
-
-                # Verifica che il file results.json esista
-                results_json_path = os.path.join(train_output_folder, "results.json")
-                if not os.path.exists(results_json_path):
-                    raise FileNotFoundError("Il file 'results.json' non è stato trovato.")
-                # Leggi il contenuto di results.json
-                with open(results_json_path, 'r') as f:
-                    results_data = json.load(f)
-        
-                # Estrai le metriche necessarie
-                if "ours_30000" in results_data:
-                    metrics = results_data["ours_30000"]
-                    ssim = metrics.get("SSIM", None)
-                    psnr = metrics.get("PSNR", None)
-                    lpips = metrics.get("LPIPS", None)
-                else:
-                    raise KeyError("La sezione 'ours_30000' non è presente nel file results.json.")
-            elif model.engine in ["GSPLAT-INRIA", "GSPLAT-MCMC"]:
-               # Verifica che il file results.json esista
-                results_json_path = os.path.join(train_output_folder, "stats/val_step29999.json")
-
-                # Leggi il contenuto di results.json
-                with open(results_json_path, 'r') as f:
-                    results_data = json.load(f)
-                ssim = results_data.get("ssim", None)
-                psnr = results_data.get("psnr", None)
-                lpips = results_data.get("lpips", None)
-                # Preparazione del dato per il database
-                # Estrai le metriche necessarie
+            if not model:
+                self.fail(model_id,"metrics_evaluation",f"Error: No model found for model_id {model_id}")
+                return
+            
+            model_dir = os.path.join(WORKING_DIR, f"{model_id}")
                 
-            results = {
-                    "ssim": ssim,
-                    "psnr": psnr,
-                    "lpips": lpips
-            }
-            model_service.update_model_status(model_id, {"status": "COMPLETED", "results": results})
-            print(f"Model {model_id} caricato su S3 con successo!")
-    
-        except FileNotFoundError as e:
-            print(f"❌ Errore: {e}")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": str(e)})
-        except NoCredentialsError:
-            print("❌ Errore: Credenziali AWS mancanti.")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": "AWS credentials missing"})
-        except PartialCredentialsError:
-            print("❌ Errore: Credenziali AWS parziali.")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": "Partial AWS credentials"})
-        except Exception as e:
-            print(f"❌ Errore durante il caricamento del modello: {e}")
-            model_service.update_model_status(model_id, {"status": "ERROR", "error_message": str(e)})
+            # 1. Verifica se sparse directory esiste (output del training)
+            output_dir = os.path.join(model_dir, 'output')
+            if not os.path.exists(output_dir):
+                self.fail(model_id,"metrics_evaluation",f"No folder output found: {e}")
+                return
 
+            engine = model.training_config.get('engine') if model.training_config else 'INRIA'
+
+            render_request = { "output_dir": output_dir}
+            response = requests.post(engine_map.get(engine).get('api-url') + "/render", json=render_request)
+            response.raise_for_status()  # Controlla che non ci siano errori nel render
+
+            metrics_request = { "output_dir": output_dir}
+            response = requests.post(engine_map.get(engine).get('api-url') + "/metrics", json=metrics_request)
+            response.raise_for_status()  # Controlla che non ci siano errori nel render
+
+            # Verifica che il file results.json esista
+            results_json_path = os.path.join(output_dir, "results.json")
+            if not os.path.exists(results_json_path):
+                raise FileNotFoundError("Il file 'results.json' non è stato trovato.")
+            # Leggi il contenuto di results.json
+            with open(results_json_path, 'r') as f:
+                results_data = json.load(f)
+
+            # Strategia 2: Cerca chiave che inizia con "ours_"
+            ours_keys = [key for key in results_data.keys() if key.startswith("ours_")]
+            results = None
+            if len(ours_keys) == 1:
+                # Solo una chiave "ours_", usala
+                key = ours_keys[0]
+                print(f"✅ Found single ours key: {key}")
+                results = self._extract_metrics_from_section(results_data[key])
+            elif len(ours_keys) > 1:
+                def extract_number(key):
+                    try:
+                        return int(key.split("_")[1])
+                    except (IndexError, ValueError):
+                        return 0
+                latest_key = max(ours_keys, key=extract_number)
+                print(f"✅ Found multiple ours keys, using latest: {latest_key}")
+                results = self._extract_metrics_from_section(results_data[latest_key])
+            else:
+                # Nessuna chiave "ours_", cerca qualsiasi chiave con metriche
+                for key, value in results_data.items():
+                    if isinstance(value, dict) and any(metric in value for metric in ["SSIM", "PSNR", "LPIPS"]):
+                        print(f"✅ Found metrics in fallback key: {key}")
+                        results = self._extract_metrics_from_section(value)
+                
+                raise KeyError(f"Nessuna sezione con metriche trovata nel file results.json. Chiavi disponibili: {list(results_data.keys())}")
+            
+            model_service.complete_phase(model_id, "metrics_evaluation",overall_status="COMPLETED",metadata={"metrics": results})
+            print(f"Model {model_id} caricato su S3 con successo!")
+        except FileNotFoundError as e:
+            self.fail(model_id,"metrics_evaluation",f"Error: {e}")
+        except NoCredentialsError:
+            self.fail(model_id,"metrics_evaluation","Error: AWS credential not found.")
+        except PartialCredentialsError:
+            self.fail(model_id,"metrics_evaluation","Error: AWS credential partially not found")
+        except Exception as e:
+            self.fail(model_id,"metrics_evaluation",f"Fail to load model: {e}")
+            
+    def _extract_metrics_from_section(self, metrics_section):
+        """Estrai metriche da una sezione specifica"""
+        return {
+            "ssim": metrics_section.get("SSIM", None),
+            "psnr": metrics_section.get("PSNR", None), 
+            "lpips": metrics_section.get("LPIPS", None)
+        }
+    def create_phase_zip(self,model_dir, folders_to_include, zip_path):
+        """
+        Crea un ZIP della fase training contenente le cartelle COLMAP specificate.
+        
+        Args:
+            model_dir: Directory del modello contenente le cartelle
+            folders_to_include: Lista delle cartelle da includere nel ZIP
+            zip_path: Percorso dove creare il file ZIP
+            
+        Returns:
+            bool: True se il ZIP è stato creato con successo
+        """
+        try:
+            print(f"📦 Creating training phase ZIP: {zip_path}")
+            print(f"📁 Folders to include: {folders_to_include}")
+            
+            # Verifica che almeno una cartella esista
+            existing_folders = []
+            for folder in folders_to_include:
+                folder_path = os.path.join(model_dir, folder)
+                if os.path.exists(folder_path):
+                    existing_folders.append(folder)
+                    print(f"  ✅ Found: {folder}")
+                else:
+                    print(f"  ⚠️ Missing: {folder}")
+            
+            if not existing_folders:
+                print(f"❌ No valid folders found to include in ZIP")
+                return False
+            
+            # Crea lo ZIP
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
+                total_files = 0
+                
+                for folder in existing_folders:
+                    folder_path = os.path.join(model_dir, folder)
+                    print(f"📂 Adding folder to ZIP: {folder}")
+                    
+                    # Aggiungi tutti i file dalla cartella
+                    for root, dirs, files in os.walk(folder_path):
+                        for file in files:
+                            # Percorso completo del file
+                            file_path = os.path.join(root, file)
+                            
+                            # Percorso relativo dalla directory del modello
+                            relative_path = os.path.relpath(file_path, model_dir)
+                            
+                            # Aggiungi il file allo ZIP mantenendo la struttura
+                            zipf.write(file_path, relative_path)
+                            total_files += 1
+                            
+                            # Log solo alcuni file per non intasare i log
+                            if total_files <= 10 or total_files % 100 == 0:
+                                print(f"  📄 Added: {relative_path}")
+                
+                print(f"📊 Total files added to ZIP: {total_files}")
+            
+            # Verifica che il ZIP sia stato creato
+            if os.path.exists(zip_path):
+                zip_size = os.path.getsize(zip_path)
+                
+                # Calcola dimensione originale per rapporto compressione
+                original_size = 0
+                for folder in existing_folders:
+                    folder_path = os.path.join(model_dir, folder)
+                    original_size += self.get_folder_size(folder_path)
+                
+                compression_ratio = (zip_size / original_size * 100) if original_size > 0 else 0
+                
+                print(f"✅ Training ZIP created successfully")
+                print(f"📦 ZIP size: {zip_size / 1024 / 1024:.2f} MB")
+                print(f"📁 Original size: {original_size / 1024 / 1024:.2f} MB")
+                print(f"🗜️ Compression ratio: {compression_ratio:.1f}%")
+                return True
+            else:
+                print(f"❌ ZIP file was not created")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error creating training ZIP: {e}")
+            return False
+
+    def get_folder_size(self,folder_path):
+        """
+        Calcola la dimensione totale di una cartella.
+        
+        Args:
+            folder_path: Percorso della cartella
+            
+        Returns:
+            int: Dimensione in bytes
+        """
+        total_size = 0
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if os.path.exists(file_path):
+                        total_size += os.path.getsize(file_path)
+        except Exception as e:
+            print(f"⚠️ Warning: Error calculating folder size for {folder_path}: {e}")
+        
+        return total_size
+    
+    def download_and_extract_phase_zip(self, zip_s3_key, extract_to_dir):
+        """
+        Scarica un ZIP della fase da S3 e lo estrae nella directory specificata.
+        
+        Args:
+            zip_s3_key: Chiave S3 del file ZIP
+            extract_to_dir: Directory dove estrarre i contenuti
+            
+        Returns:
+            bool: True se l'operazione è riuscita
+        """
+        try:
+            print(f"📦 Downloading phase ZIP from S3: {zip_s3_key}")
+            
+            # Usa una directory temporanea per scaricare il ZIP
+            with tempfile.TemporaryDirectory() as temp_dir:
+                local_zip_path = os.path.join(temp_dir, "phase.zip")
+                
+                # Scarica il ZIP da S3
+                repository_service.download(zip_s3_key, local_zip_path)
+                
+                if not os.path.exists(local_zip_path):
+                    print(f"❌ Failed to download ZIP from S3")
+                    return False
+                
+                zip_size = os.path.getsize(local_zip_path)
+                print(f"✅ ZIP downloaded successfully: {zip_size / 1024 / 1024:.2f} MB")
+                
+                # Estrai il ZIP
+                print(f"📂 Extracting ZIP to: {extract_to_dir}")
+                
+                with zipfile.ZipFile(local_zip_path, 'r') as zip_ref:
+                    # Lista i contenuti del ZIP per debug
+                    zip_contents = zip_ref.namelist()
+                    print(f"📋 ZIP contains {len(zip_contents)} files")
+                    
+                    # Mostra alcuni file di esempio
+                    example_files = zip_contents[:3]
+                    if len(zip_contents) > 3:
+                        example_files.append("...")
+                    print(f"📄 Example files: {example_files}")
+                    
+                    # Estrai tutti i file
+                    zip_ref.extractall(extract_to_dir)
+                    
+                print(f"✅ ZIP extracted successfully")
+                
+                # Verifica che l'estrazione sia andata a buon fine
+                extracted_files = []
+                for root, dirs, files in os.walk(extract_to_dir):
+                    extracted_files.extend(files)
+                
+                print(f"📊 Extracted {len(extracted_files)} files total")
+                return True
+                
+        except Exception as e:
+            print(f"❌ Error downloading/extracting ZIP: {e}")
+            return False
+    
+    def create_phase_zip_and_upload(self,model_id:str,model_dir: str,zip_file_name: str,target_folders: []):
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+                # Costruisci il nome del ZIP usando l'enum Phase
+                zip_path = os.path.join(temp_dir, zip_file_name)
+                success = self.create_phase_zip(model_dir, target_folders, zip_path)
+
+                # 6. Upload risultati COLMAP su S3
+                # Lista delle cartelle/file da uploadare
+                
+                if success and os.path.exists(zip_path):
+                    zip_size = os.path.getsize(zip_path)
+                    print(f"✅ Training ZIP created successfully: {zip_size / 1024 / 1024:.2f} MB")
+                    
+                    # Upload del ZIP nella cartella staging
+                    zip_s3_key = f"{S3_STAGING_PREFIX}/{model_id}/{zip_file_name}"
+                    repository_service.upload(zip_path, zip_s3_key)
+                    print(f"✅ Phase ZIP caricato in staging: {zip_s3_key}")
+                    
+                    # Il file ZIP viene automaticamente cancellato quando esce dal with
+                    print(f"🧹 Temporary  ZIP will be cleaned up automatically")
+                else:
+                    self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
 
 
     def send_to_next_phase(self, model_id, next_queue, additional_data=None):

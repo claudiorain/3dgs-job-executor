@@ -22,6 +22,58 @@ class Image:
 
 class FrameExtractor:
 
+    def calculate_sharp_frames_params(self,video_path, quality_level):
+        """
+        Calcola parametri ottimali per sharp-frames usando logica del FrameExtractor
+        """
+        frame_extractor = FrameExtractor()
+        
+        # 1. Ottieni info video + rotazione
+        cap = cv2.VideoCapture(video_path)
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / video_fps
+        cap.release()
+        
+        # 2. Usa le funzioni esistenti per rotazione
+        rotation_angle = frame_extractor._get_normalized_rotation(video_path)
+        
+        # 3. Calcola dimensioni considerando rotazione
+        width, height = original_width, original_height
+        if rotation_angle in [90, 270]:
+            width, height = height, width  # Swap per rotazione
+        
+        # 4. Calcola target width per sharp-frames
+        target_width = None
+        max_dimension = max(width, height)
+        if max_dimension > 1920:  # Serve downscale
+            scale_factor = 1920 / max_dimension
+            target_width = int(width * scale_factor)
+        
+        # 5. Calcola fps basato su durata video e qualità
+        target_frames_map = {
+            'fast': 60,
+            'balanced': 120,
+            'quality': 180,
+            'ultra': 240
+        }
+        
+        target_frames = target_frames_map[quality_level]
+        extraction_fps = target_frames / duration
+        
+        # Cap al fps originale del video
+        extraction_fps = min(extraction_fps, video_fps)
+        
+        # Minimo assoluto per evitare errori
+        extraction_fps = max(0.1, extraction_fps)
+        
+        return {
+            'width': target_width,
+            'fps': round(extraction_fps, 2)
+        }
+
     def _calculate_downscaled_dimensions(self, original_width, original_height,
                                         downscale_factor, auto_downscale_to_fhd):
         """

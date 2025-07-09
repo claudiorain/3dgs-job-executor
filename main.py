@@ -2,18 +2,16 @@
 from config.message_queue import get_connection, get_channel, close_connection
 from services.model_service import ModelService
 from services.repository_service import RepositoryService
-import os
 import json
 import asyncio
 import signal
 import sys
-import time
 
 # Importa la classe QueueJobService dal tuo file esistente
 from services.queue_job_consumer_service import QueueJobService
 
 queues = [
-            'video_download_queue',
+            'frame_extraction_queue',
             'point_cloud_queue',
             'model_training_queue',
             'upload_queue',
@@ -93,16 +91,16 @@ class SequentialJobProcessor:
              # Conferma il messaggio solo dopo che è stato processato con successo
             ch.basic_ack(delivery_tag=method.delivery_tag)
             
-            if method.routing_key == "video_download_queue":
-                await self.job_service.download_and_process_video(ch, method, model_id, data)
+            if method.routing_key == "frame_extraction_queue":
+                await self.job_service.handle_frame_extraction(ch, method, model_id, data)
             elif method.routing_key == "point_cloud_queue":
-                await self.job_service.build_point_cloud(ch, method, model_id, data)
+                await self.job_service.handle_point_cloud_building(ch, method, model_id, data)
             elif method.routing_key == "model_training_queue":
-                await self.job_service.train_model(ch, method, model_id, data)
+                await self.job_service.handle_training(ch, method, model_id, data)
             elif method.routing_key == "upload_queue":
-                await self.job_service.upload_model(ch, method, model_id, data)
+                await self.job_service.handle_model_upload(ch, method, model_id, data)
             elif method.routing_key == "metrics_generation_queue":
-                await self.job_service.generate_metrics(ch, method, model_id, data)
+                await self.job_service.handle_metrics_generation(ch, method, model_id, data)
             
            
             print(f"Job completato: {method.routing_key} per model_id: {model_id}")
