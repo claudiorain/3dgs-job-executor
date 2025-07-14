@@ -85,9 +85,7 @@ class QueueJobService:
             # ✅ Se in cache: copia dalla cache al percorso locale
             # ⬇️ Se non in cache: scarica da S3 e copia in cache
             repository_service.download(video_s3_key, local_video_path)
-            
-            frames_output_folder = os.path.join(model_dir, 'input')
-            
+                        
             thumbnail_suffix = f"thumbnail.jpg"
             thumbnail_s3_key = f"{S3_DELIVERY_PREFIX}/{model_id}/{thumbnail_suffix}"
             
@@ -100,101 +98,130 @@ class QueueJobService:
             video_size = os.path.getsize(local_video_path)
             print(f"📊 Video size: {video_size / 1024 / 1024:.2f} MB")
             
-            # Crea le cartelle necessarie
-            os.makedirs(frames_output_folder, exist_ok=True)
-                
+            engine = model.training_config.get('engine') if model.training_config else None
+            quality_level = model.training_config.get('quality_level') if model.training_config else None
+            if not engine:
+                self.fail(model_id,"training",f"Error: No engine found in model {model_id}")
+                return
+
+            print(f"🔍 DEBUG: engine = {engine}")
+            print(f"🔍 DEBUG: quality_level = {quality_level}")
+            print(f"🔍 DEBUG: training_params_service type = {type(training_params_service)}")
+            print(f"🔍 DEBUG: Chiamando generate_params...")
+
+            generated_params = training_params_service.generate_params(Engine(engine),QualityLevel(quality_level))
+
+            print(f"🔍 DEBUG: generate_params completato!")
+            print(f"🔍 DEBUG: generated_params = {generated_params}")
             # Calcola parametri ottimizzati
-            optimized_params = frame_extractor.calculate_sharp_frames_params(local_video_path)
-            print(f"Using FPS: {round(optimized_params['fps'])}")
-            print(f"Resizing images to: {optimized_params['width']}")
+            target_width = frame_extractor.calculate_target_width(local_video_path,generated_params.final_params['resolution'])
+            target_fps = frame_extractor.calculate_extraction_fps(local_video_path)
+            print(f"Using FPS: {target_fps}")
+            print(f"Resizing images to: {target_width}")
 
-            # 🆕 SHARP FRAMES CLI - Comando corretto
-            cmd = [
-                "sharp-frames",
-                local_video_path,
-                frames_output_folder,
-                "--selection-method", "batched",  # o "uniform"
-                "--fps" , "8"
-            ]
-            
-            # Aggiungi --width solo se necessario
-            if optimized_params['width'] is not None:
-                cmd.extend(["--width", str(optimized_params['width'])])
+            with tempfile.TemporaryDirectory() as temp_sharp_output:
+                # 🆕 SHARP FRAMES CLI - Comando corretto
+                cmd = [
+                    "sharp-frames",
+                    local_video_path,
+                    temp_sharp_output,
+                    "--selection-method", "best-n",  # o "uniform"
+                    "--min-buffer", "3",  # o "uniform"
+                    "--num-frames" , str(250)
+                ]
+                # Aggiungi --width solo se necessario
+                if target_width is not None:
+                    cmd.extend(["--width", str(target_width)])
 
-            print(f"🔧 Running: {' '.join(cmd)}")
+                print(f"🔧 Running: {' '.join(cmd)}")
             
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                print(f"✅ Sharp-frames completed successfully")
-                print(f"stdout: {result.stdout}")
-            except subprocess.CalledProcessError as e:
-                print(f"❌ Sharp-frames failed with exit code {e.returncode}")
-                print(f"📝 stdout: {e.stdout}")
-                print(f"🔴 stderr: {e.stderr}")
-                
-                # Debug aggiuntivo
-                print(f"🔍 Video file exists: {os.path.exists(local_video_path)}")
-                print(f"🔍 Video file size: {os.path.getsize(local_video_path) if os.path.exists(local_video_path) else 'N/A'} bytes")
-                print(f"🔍 Output dir exists: {os.path.exists(frames_output_folder)}")
-                print(f"🔍 Output dir writable: {os.access(frames_output_folder, os.W_OK)}")
-        
-                raise Exception(f"Sharp-frames error: {e.stderr}")
-            
-            print(f"✅ Sharp Frames output: {result.stdout}")
-            if result.stderr:
-                print(f"⚠️ Sharp Frames warnings: {result.stderr}")       
-            
-            # Conta i frame estratti
-            frame_files = []
-            if os.path.exists(frames_output_folder):
-                for f in sorted(os.listdir(frames_output_folder)):
-                    if f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        frame_files.append(os.path.join(frames_output_folder, f))
-            
-            frame_count = len(frame_files)
-            print(f"📊 Sharp frames extracted: {frame_count}")
-
-            # Gestione thumbnail
-            thumbnail_path = frame_files[0] if frame_files else None
-            print(f"✅ Thumbnail local path: {thumbnail_path} and exists? " + str(os.path.exists(thumbnail_path) if thumbnail_path else False))
-            
-            
-            if thumbnail_path and os.path.exists(thumbnail_path):
                 try:
-                    repository_service.upload(thumbnail_path, thumbnail_s3_key)
-                    print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
-                except Exception as e:
-                    print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
-                    thumbnail_s3_key = None
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    print(f"✅ Sharp-frames completed successfully")
+                    print(f"stdout: {result.stdout}")
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ Sharp-frames failed with exit code {e.returncode}")
+                    print(f"📝 stdout: {e.stdout}")
+                    print(f"🔴 stderr: {e.stderr}")
+                    
+                    # Debug aggiuntivo
+                    print(f"🔍 Video file exists: {os.path.exists(local_video_path)}")
+                    print(f"🔍 Video file size: {os.path.getsize(local_video_path) if os.path.exists(local_video_path) else 'N/A'} bytes")
+                    print(f"🔍 Output dir exists: {os.path.exists(temp_sharp_output)}")
+                    print(f"🔍 Output dir writable: {os.access(temp_sharp_output, os.W_OK)}")
+            
+                    raise Exception(f"Sharp-frames error: {e.stderr}")
+            
+                print(f"✅ Sharp Frames output: {result.stdout}")
+                if result.stderr:
+                    print(f"⚠️ Sharp Frames warnings: {result.stderr}")       
+            
+                sharped_frames = sorted([
+                    f for f in os.listdir(temp_sharp_output)
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+                ])
+                print(f"📸 Frame generati da sharp-frames: {len(sharped_frames)}")
+                print(f"📂 Esempi frame: {sharped_frames[:5]}")
+                
 
-            # 📤 UPLOAD CARTELLA INPUT (FRAMES) SU S3
-            self.create_phase_zip_and_upload(model_id,model_dir,POINT_CLOUD_BUILDING_PHASE_ZIP_NAME,['input'])
+                frames_output_folder = os.path.join(model_dir, 'input')
+                os.makedirs(frames_output_folder, exist_ok=True)
+
+                filtered_count = frame_extractor.filter_similar_frames(
+                temp_sharp_output,
+                frames_output_folder,
+                similarity_threshold=0.80  # oppure 0.70 a seconda del tuo target
+                )
+
+                # Conta i frame estratti
+                frame_files = []
+                if os.path.exists(frames_output_folder):
+                    for f in sorted(os.listdir(frames_output_folder)):
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                            frame_files.append(os.path.join(frames_output_folder, f))
+                print(f"📊 Sharp frames extracted: {len(filtered_count)}")
+
+                # Gestione thumbnail
+                thumbnail_path = frame_files[0] if frame_files else None
+                print(f"✅ Thumbnail local path: {thumbnail_path} and exists? " + str(os.path.exists(thumbnail_path) if thumbnail_path else False))
+                
+                
+                if thumbnail_path and os.path.exists(thumbnail_path):
+                    try:
+                        repository_service.upload(thumbnail_path, thumbnail_s3_key)
+                        print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
+                    except Exception as e:
+                        print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
+                        thumbnail_s3_key = None
+
+                # 📤 UPLOAD CARTELLA INPUT (FRAMES) SU S3
+                self.create_phase_zip_and_upload(model_id,model_dir,POINT_CLOUD_BUILDING_PHASE_ZIP_NAME,['input'])
 
 
-            # ✅ COMPLETE FASE con metadata
-            phase_metadata = {
-                "frame_count": frame_count,
-                "video_local_path": local_video_path,  # Path del video per debug
-                "video_size_mb": video_size / 1024 / 1024 if 'video_size' in locals() else None,
-                "processing_params": {
-                    "outlier_window_size": 10,
-                    "outlier_sensitivity": 60,
-                    "selection_method": "outlier-removal",
-                    "fps": round(optimized_params['fps']),
-                    "width": optimized_params['width']
+                # ✅ COMPLETE FASE con metadata
+                phase_metadata = {
+                    "frame_count": len(filtered_count),
+                    "video_local_path": local_video_path,  # Path del video per debug
+                    "video_size_mb": video_size / 1024 / 1024 if 'video_size' in locals() else None,
+                    "processing_params": {
+                        "outlier_window_size": 10,
+                        "outlier_sensitivity": 60,
+                        "selection_method": "outlier-removal",
+                        "fps": target_fps,
+                        "width": target_width
+                    }
                 }
-            }
 
-            model_service.complete_phase(model_id, "frame_extraction", 
-                                    metadata=phase_metadata)
-            
-            # Aggiorna il modello con thumbnail
-            if thumbnail_suffix:
-                model_service.update_model_status(model_id, {
-                    "thumbnail_suffix": thumbnail_suffix  # ✅ A livello root del modello
-                })
-            
-            self.send_to_next_phase(model_id, "point_cloud_queue")
+                model_service.complete_phase(model_id, "frame_extraction", 
+                                        metadata=phase_metadata)
+                
+                # Aggiorna il modello con thumbnail
+                if thumbnail_suffix:
+                    model_service.update_model_status(model_id, {
+                        "thumbnail_suffix": thumbnail_suffix  # ✅ A livello root del modello
+                    })
+                
+                self.send_to_next_phase(model_id, "point_cloud_queue")
             
         except Exception as e:
             print(f"❌ Error in frame extraction: {e}")

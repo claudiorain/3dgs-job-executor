@@ -4,10 +4,10 @@ from typing import Optional, Dict, Any, List
 from enum import Enum
 
 class QualityLevel(str, Enum):
-    DRAFT = "draft"
-    STANDARD = "standard"
-    HIGH = "high"
-    ULTRA = "ultra"
+    """Livelli di qualità - CORRETTI per coerenza con MongoDB"""
+    FAST = "fast"
+    BALANCED = "balanced"  # ✅ Corretto: ora combacia con MongoDB
+    QUALITY = "quality"
 
 class AlgorithmMetadata(BaseModel):
     """Metadati dell'algoritmo"""
@@ -50,7 +50,7 @@ class ValidationRule(BaseModel):
 
 class TrainingParamsConfig(BaseModel):
     """
-    Modello generico per configurazione parametri training.
+    Modello SEMPLIFICATO per configurazione parametri training.
     Riutilizzabile per tutti gli algoritmi (GS, MCMC, Taming, etc.)
     """
     
@@ -64,7 +64,7 @@ class TrainingParamsConfig(BaseModel):
     # === METADATI ===
     metadata: AlgorithmMetadata
     
-    # === PARAMETRI BASE (livello "standard") ===
+    # === PARAMETRI BASE (livello "balanced") ===
     base_params: Dict[str, Any] = Field(
         default_factory=dict,
         description="Valori base per tutti i parametri dell'algoritmo"
@@ -112,147 +112,23 @@ class TrainingParamsConfig(BaseModel):
     class Config:
         use_enum_values = True
         allow_population_by_field_name = True
-        schema_extra = {
-            "example": {
-                "algorithm_name": "gaussian_splatting_original",
-                "display_name": "3D Gaussian Splatting (Original)",
-                "version": "1.0",
-                "active": True,
-                "metadata": {
-                    "description": "Algoritmo originale 3D Gaussian Splatting",
-                    "min_gpu_memory_gb": 8
-                },
-                "base_params": {
-                    "iterations": 30000,
-                    "resolution": 1,
-                    "opacity_lr": 0.05
-                },
-                "quality_multipliers": {
-                    "draft": {
-                        "iterations": 0.5,
-                        "opacity_lr": 2.0
-                    },
-                    "standard": {
-                        "iterations": 1.0,
-                        "opacity_lr": 1.0
-                    }
-                }
-            }
-        }
-
-class TrainingParamsResponse(BaseModel):
-    """Response model per API"""
-    id: str = Field(alias='_id')
-    algorithm_name: str
-    display_name: str
-    version: str
-    active: bool
-    metadata: AlgorithmMetadata
-    
-    # Parametri semplificati per response
-    available_quality_levels: List[QualityLevel]
-    parameter_count: int
-    hardware_requirements: Dict[str, Any]
-    
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-    
-    class Config:
-        allow_population_by_field_name = True
-
-# === MODELLI PER GENERAZIONE PARAMETRI ===
-
-class GenerateParamsRequest(BaseModel):
-    """Richiesta per generare parametri"""
-    algorithm_name: str
-    quality_level: QualityLevel
-    gpu_memory_gb: Optional[float] = None
-    manual_overrides: Dict[str, Any] = Field(default_factory=dict)
 
 class GeneratedParams(BaseModel):
-    """Parametri generati pronti per l'uso"""
+    """
+    Parametri generati pronti per l'uso - SEMPLIFICATO
+    Rimossi metadati inutili, mantenuto solo l'essenziale
+    """
     algorithm_name: str
     quality_level: QualityLevel
     gpu_memory_gb: float
     
-    # Parametri finali calcolati
+    # Parametri finali calcolati - QUESTO È L'OUTPUT PRINCIPALE
     final_params: Dict[str, Any]
     
-    # Metadati calcolo
-    applied_quality_multipliers: Dict[str, float]
-    applied_hardware_multipliers: Dict[str, float]
-    applied_overrides: Dict[str, Any]
-    calculated_params: Dict[str, Any]
+    # Metadati essenziali
+    applied_multipliers: Dict[str, float] = Field(default_factory=dict)
+    applied_overrides: Dict[str, Any] = Field(default_factory=dict)
     
-    # Stime
+    # Stime opzionali
     estimated_training_time_minutes: Optional[int] = None
     estimated_vram_usage_gb: Optional[float] = None
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "algorithm_name": "gaussian_splatting_original",
-                "quality_level": "high",
-                "gpu_memory_gb": 16.0,
-                "final_params": {
-                    "iterations": 45000,
-                    "resolution": 1,
-                    "opacity_lr": 0.02,
-                    "eval": True
-                },
-                "estimated_training_time_minutes": 90
-            }
-        }
-
-# === HELPER FUNCTIONS ===
-
-def create_gaussian_splatting_config() -> TrainingParamsConfig:
-    """Helper per creare config Gaussian Splatting da zero"""
-    return TrainingParamsConfig(
-        algorithm_name="gaussian_splatting_original",
-        display_name="3D Gaussian Splatting (Original)",
-        metadata=AlgorithmMetadata(
-            description="Algoritmo originale 3D Gaussian Splatting",
-            min_gpu_memory_gb=8
-        ),
-        base_params={
-            "iterations": 30000,
-            "resolution": 1,
-            "densify_grad_threshold": 0.0002,
-            "opacity_lr": 0.05,
-            "eval": True
-        },
-        quality_multipliers={
-            QualityLevel.DRAFT: {"iterations": 0.5, "opacity_lr": 2.0},
-            QualityLevel.STANDARD: {"iterations": 1.0, "opacity_lr": 1.0},
-            QualityLevel.HIGH: {"iterations": 1.5, "opacity_lr": 0.4},
-            QualityLevel.ULTRA: {"iterations": 2.0, "opacity_lr": 0.2}
-        },
-        hardware_config=HardwareConfig(),
-        created_at=datetime.utcnow()
-    )
-
-def create_mcmc_config() -> TrainingParamsConfig:
-    """Helper per creare config MCMC (esempio)"""
-    return TrainingParamsConfig(
-        algorithm_name="gaussian_splatting_mcmc",
-        display_name="MCMC Gaussian Splatting",
-        metadata=AlgorithmMetadata(
-            description="Gaussian Splatting con MCMC sampling",
-            min_gpu_memory_gb=8
-        ),
-        base_params={
-            "max_gaussians": 2000000,
-            "mcmc_steps": 100,
-            "temperature": 0.1,
-            "eval": True
-        },
-        quality_multipliers={
-            QualityLevel.DRAFT: {"mcmc_steps": 0.5, "temperature": 2.0},
-            QualityLevel.STANDARD: {"mcmc_steps": 1.0, "temperature": 1.0},
-            QualityLevel.HIGH: {"mcmc_steps": 1.5, "temperature": 0.7},
-            QualityLevel.ULTRA: {"mcmc_steps": 2.0, "temperature": 0.5}
-        },
-        hardware_config=HardwareConfig(),
-        created_at=datetime.utcnow()
-    )

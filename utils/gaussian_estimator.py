@@ -738,7 +738,7 @@ if __name__ == "__main__":
                         help="Use original conservative estimation (reduces all estimates by 20%%)")
     parser.add_argument("--aggressive_mode", action="store_true", 
                         help="Use aggressive estimation (increases all estimates by 30%%)")
-    parser.add_argument("--quality_target", choices=['draft', 'standard', 'high', 'ultra'], 
+    parser.add_argument("--quality_target", choices=['fast', 'balanced', 'quality'], 
                         default='standard', help="Quality target affects estimation aggressiveness")
     
     args = parser.parse_args()
@@ -756,7 +756,6 @@ if __name__ == "__main__":
         'draft': 0.7,
         'standard': 1.0,
         'high': 1.3,
-        'ultra': 1.6
     }
     quality_multiplier = quality_multipliers[args.quality_target]
     

@@ -24,9 +24,7 @@ def get_connection():
     return connection
 
 def get_channel(connection):
-    channel = connection.channel()
-    channel.queue_declare(queue='3dgs', durable=True)  # Assicuriamoci che la coda '3dgs' esista
-    return channel
+    return connection.channel()
 
 def close_connection(connection):
      if connection and connection.is_open:

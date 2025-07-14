@@ -57,7 +57,6 @@ class FrameExtractor:
             'fast': 60,
             'balanced': 120,
             'quality': 180,
-            'ultra': 240
         }
         
         target_frames = target_frames_map[quality_level]

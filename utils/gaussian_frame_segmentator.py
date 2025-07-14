@@ -230,29 +230,25 @@ class GroundingDINOSAMSegmentator:
                 box=box_xyxy.numpy(),  # Usa anche il box come hint
                 multimask_output=True
             )
-            
+
             # Scegli la maschera migliore
             best_mask_idx = np.argmax(scores)
             best_mask = masks[best_mask_idx]
             mask_score = scores[best_mask_idx]
-            
+
             print(f"✓ SAM2 segmentation score: {mask_score:.3f}")
-            
-            # 6. CREA OUTPUT FINALE
-            result = np.zeros((H, W, 4), dtype=np.uint8)
-            result[:, :, :3] = image_source  # RGB
-            result[:, :, 3] = 0  # Alpha trasparente
 
-            # CORREZIONE: Assicurati che best_mask sia boolean
-            best_mask = best_mask.astype(bool)  # <-- AGGIUNGI QUESTA RIGA
-            result[best_mask, 3] = 255  # Alpha opaco dove c'è l'oggetto
+            # 6. CREA OUTPUT FINALE (VARIANTE B - sfondo nero, niente alpha)
+            best_mask = best_mask.astype(bool)  # assicura che sia boolean
+            result = image_source.copy()
+            result[~best_mask] = 0  # azzera i pixel fuori dalla maschera (sfondo nero)
 
-            # Anche il calcolo del coverage può avere problemi simili:
-            coverage = np.sum(best_mask.astype(bool)) / best_mask.size  # <-- MODIFICA ANCHE QUESTA
-            
+            # Calcolo coverage corretto
+            coverage = np.sum(best_mask) / best_mask.size
+
             return {
                 'success': True,
-                'result': result,
+                'result': result,  # RGB puro, con sfondo nero
                 'mask': best_mask,
                 'coverage': coverage,
                 'grounding_confidence': best_confidence,
@@ -265,7 +261,7 @@ class GroundingDINOSAMSegmentator:
                     'sam_masks': masks,
                     'sam_scores': scores
                 }
-            }
+}
             
         except Exception as e:
             print(f"❌ Errore: {e}")
