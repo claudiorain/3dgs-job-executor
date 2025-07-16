@@ -16,6 +16,7 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 import tempfile
 import zipfile
 import re
+from utils.opacity_converter import convert_taming_opacity
 
 model_service = ModelService()
 repository_service = RepositoryService()
@@ -433,6 +434,11 @@ class QueueJobService:
         model_service.start_phase(model_id, "upload")
         
         try:
+            model = model_service.get_model_by_id(model_id)
+            if not model:
+                self.fail(model_id,"training",f"Error: No model found for model_id {model_id}")
+                return
+            
             with tempfile.TemporaryDirectory() as temp_dir:
                 # Crea i percorsi come al solito, ma per gsplat_path utilizziamo la cartella temporanea
                 model_dir = os.path.join(WORKING_DIR, f"{model_id}")
@@ -446,11 +452,13 @@ class QueueJobService:
 
                 ply_path = self.find_latest_iteration_folder(output_dir)
                 cameras_file_path = os.path.join(output_dir, "cameras.json")
+            
+                engine = model.training_config.get('engine') if model.training_config else None
 
                 # Usa la cartella temporanea per il file .splat
                 gsplat_path = os.path.join(temp_dir, "point_cloud.splat")
                 # Processa il file .ply e salva il .splat nella cartella temporanea
-                save_splat_file(process_ply_to_splat(ply_path), gsplat_path)
+                save_splat_file(process_ply_to_splat(ply_path,engine == Engine.TAMING.value), gsplat_path)
 
                 # Aggiungi il file cameras.json alla cartella temporanea
                 shutil.copy(cameras_file_path, temp_dir)
