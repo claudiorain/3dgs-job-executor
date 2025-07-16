@@ -76,6 +76,14 @@ class SequentialJobProcessor:
             if not job_processed:
                 await asyncio.sleep(5)  # Pausa di 5 secondi prima di ricontrollare le code
     
+    def send_to_next_phase(self, model_id, next_queue, additional_data=None):
+        """Invia il job alla fase successiva"""
+        self.channel.basic_publish(
+            exchange='',
+            routing_key=next_queue,
+            body=json.dumps({"model_id": model_id, "additional_data": additional_data})
+        )
+         
     async def process_job(self, ch, method, properties, body):
         """Processa un singolo job"""
         try:
@@ -88,19 +96,35 @@ class SequentialJobProcessor:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
             
-             # Conferma il messaggio solo dopo che è stato processato con successo
+            # Conferma messaggio dopo parsing
             ch.basic_ack(delivery_tag=method.delivery_tag)
-            
+    
+            # FASE CONSUMER: Routing ed esecuzione handler
+            success = False
             if method.routing_key == "frame_extraction_queue":
-                await self.job_service.handle_frame_extraction(ch, method, model_id, data)
+                success = await self.job_service.handle_frame_extraction(ch, method,model_id, data)
+                next_queue = "point_cloud_queue" if success else None
+                
             elif method.routing_key == "point_cloud_queue":
-                await self.job_service.handle_point_cloud_building(ch, method, model_id, data)
+                success = await self.job_service.handle_point_cloud_building(ch, method,model_id, data)
+                next_queue = "model_training_queue" if success else None
+                
             elif method.routing_key == "model_training_queue":
-                await self.job_service.handle_training(ch, method, model_id, data)
+                success = await self.job_service.handle_training(ch, method,model_id, data)
+                next_queue = "upload_queue" if success else None
+                
             elif method.routing_key == "upload_queue":
-                await self.job_service.handle_model_upload(ch, method, model_id, data)
+                success = await self.job_service.handle_model_upload(ch, method,model_id, data)
+                next_queue = "metrics_generation_queue" if success else None
+                
             elif method.routing_key == "metrics_generation_queue":
-                await self.job_service.handle_metrics_generation(ch, method, model_id, data)
+                success = await self.job_service.handle_metrics_generation(ch, method,model_id, data)
+                next_queue = None  # Fine workflow
+            
+            # FASE PRODUCER: Gestione centralizzata della coda successiva
+            if success and next_queue:
+                self.send_to_next_phase(model_id, next_queue)
+            
             
            
             print(f"Job completato: {method.routing_key} per model_id: {model_id}")
