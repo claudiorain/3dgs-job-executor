@@ -19,9 +19,11 @@ class AlgorithmMetadata(BaseModel):
     notes: Optional[str] = None
 
 class ResolutionThreshold(BaseModel):
-    """Soglia per risoluzione automatica"""
+    """Soglia per risoluzione automatica - AGGIORNATO per resolution_scale_factor"""
     vram_threshold: float = Field(description="GB VRAM minima per questa risoluzione")
-    resolution: int = Field(description="Valore resolution (-1 per auto, 1+ per fattori)")
+    target_width: int = Field(description="Width da utilizzare")
+    target_height: int = Field(description="Height da utilizzare")
+
     description: Optional[str] = None
 
 class ScalingFormula(BaseModel):
@@ -50,8 +52,8 @@ class ValidationRule(BaseModel):
 
 class TrainingParamsConfig(BaseModel):
     """
-    Modello SEMPLIFICATO per configurazione parametri training.
-    Riutilizzabile per tutti gli algoritmi (GS, MCMC, Taming, etc.)
+    Modello AGGIORNATO per configurazione parametri training.
+    Con separazione pulita tra training_params e preprocessing_params.
     """
     
     # === IDENTIFICAZIONE ===
@@ -67,19 +69,19 @@ class TrainingParamsConfig(BaseModel):
     # === PARAMETRI BASE (livello "balanced") ===
     base_params: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Valori base per tutti i parametri dell'algoritmo"
+        description="Valori base per tutti i parametri di training"
     )
     
-    # === MOLTIPLICATORI QUALITÀ ===
+    # === MOLTIPLICATORI QUALITÀ (solo training params) ===
     quality_multipliers: Dict[QualityLevel, Dict[str, float]] = Field(
         default_factory=dict,
-        description="Moltiplicatori per ogni livello di qualità"
+        description="Moltiplicatori per ogni livello di qualità (solo training params)"
     )
     
-    # === OVERRIDE QUALITÀ (valori sostitutivi) ===
-    quality_overrides: Dict[QualityLevel, Dict[str, Any]] = Field(
+    # 🆕 === PREPROCESSING PARAMS (sostituisce quality_overrides) ===
+    preprocessing_params: Dict[QualityLevel, Dict[str, Any]] = Field(
         default_factory=dict,
-        description="Valori che sostituiscono (non moltiplicano) per qualità"
+        description="Parametri di preprocessing per ogni livello di qualità (resolution_scale_factor, target_frames, etc.)"
     )
     
     # === CONFIGURAZIONE HARDWARE ===
@@ -88,7 +90,7 @@ class TrainingParamsConfig(BaseModel):
     # === PARAMETRI CALCOLATI POST-QUALITÀ ===
     post_calculation: Dict[str, CalculatedParam] = Field(
         default_factory=dict,
-        description="Parametri calcolati dopo applicazione moltiplicatori"
+        description="Parametri calcolati dopo applicazione moltiplicatori (solo training params)"
     )
     
     # === LIMITI HARDWARE (stime, non parametri) ===
@@ -100,7 +102,7 @@ class TrainingParamsConfig(BaseModel):
     # === VALIDAZIONI ===
     validation_rules: List[ValidationRule] = Field(
         default_factory=list,
-        description="Regole di validazione parametri finali"
+        description="Regole di validazione parametri finali (solo training params)"
     )
     
     # === TIMESTAMP ===
@@ -115,19 +117,32 @@ class TrainingParamsConfig(BaseModel):
 
 class GeneratedParams(BaseModel):
     """
-    Parametri generati pronti per l'uso - SEMPLIFICATO
-    Rimossi metadati inutili, mantenuto solo l'essenziale
+    Parametri generati pronti per l'uso - AGGIORNATO con separazione
     """
     algorithm_name: str
     quality_level: QualityLevel
     gpu_memory_gb: float
     
-    # Parametri finali calcolati - QUESTO È L'OUTPUT PRINCIPALE
-    final_params: Dict[str, Any]
+    # 🎯 Parametri finali di training - QUESTO È L'OUTPUT PRINCIPALE per il training
+    final_params: Dict[str, Any] = Field(
+        description="Parametri di training pronti per l'uso"
+    )
+    
+    # 🆕 Parametri di preprocessing - NUOVO OUTPUT per frame extraction, etc.
+    preprocessing_params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Parametri per preprocessing (target_width,target_height, target_frames, etc.)"
+    )
     
     # Metadati essenziali
-    applied_multipliers: Dict[str, float] = Field(default_factory=dict)
-    applied_overrides: Dict[str, Any] = Field(default_factory=dict)
+    applied_multipliers: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Moltiplicatori hardware applicati ai training params"
+    )
+    applied_overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Override manuali applicati ai training params"
+    )
     
     # Stime opzionali
     estimated_training_time_minutes: Optional[int] = None

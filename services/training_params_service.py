@@ -21,8 +21,8 @@ ENGINE_TO_ALGORITHM = {
 
 class TrainingParamsService:
     """
-    Service SEMPLIFICATO per gestire parametri di training da MongoDB.
-    Focus su funzionalità essenziali, sicurezza e maintainability.
+    Service per gestire parametri di training da MongoDB.
+    Con separazione pulita tra training_params e preprocessing_params.
     """
     
     def __init__(self):
@@ -38,8 +38,7 @@ class TrainingParamsService:
         manual_overrides: Dict[str, Any] = None
     ) -> GeneratedParams:
         """
-        Genera parametri finali pronti per il training.
-        SEMPLIFICATO: meno metadati, più focus sui risultati.
+        Genera parametri finali con separazione training/preprocessing.
         """
         
         print("🎯 === INIZIO generate_params ===")
@@ -63,71 +62,87 @@ class TrainingParamsService:
                 gpu_memory_gb = self._detect_gpu_memory()
             print(f"✅ GPU Memory: {gpu_memory_gb} GB")
             
-            # 3. Applica moltiplicatori qualità
-            print("⚙️ Step 3: Applicazione quality transforms...")
-            params = self._apply_quality_transforms(
+            # 3. Carica preprocessing params dal config
+            print("📦 Step 3: Caricamento preprocessing params...")
+            preprocessing_params = config.preprocessing_params.get(quality_level, {})
+            print(f"✅ Preprocessing params: {preprocessing_params}")
+            
+            # 4. Applica quality transforms (solo training)
+            print("⚙️ Step 4: Applicazione quality transforms...")
+            training_params, final_preprocessing = self._apply_quality_transforms(
                 config.base_params.copy(), 
                 config.quality_multipliers.get(quality_level, {}),
-                config.quality_overrides.get(quality_level, {})
+                preprocessing_params
             )
-            print(f"✅ Params dopo quality: {params}")
+            print(f"✅ Training params dopo quality: {training_params}")
+            print(f"✅ Preprocessing params finali: {final_preprocessing}")
             
-            # 4. Applica moltiplicatori hardware
-            print("🔧 Step 4: Applicazione hardware scaling...")
-            params, hw_multipliers = self._apply_hardware_scaling(
-                params,
+            # 5. Applica hardware scaling
+            print("🔧 Step 5: Applicazione hardware scaling...")
+            training_params, hw_multipliers, final_preprocessing = self._apply_hardware_scaling(
+                training_params,
                 config.hardware_config,
-                gpu_memory_gb
+                gpu_memory_gb,
+                final_preprocessing
             )
-            print(f"✅ Params dopo hardware scaling: {params}")
+            print(f"✅ Training params dopo hardware scaling: {training_params}")
             print(f"✅ Hardware multipliers: {hw_multipliers}")
+            print(f"✅ Final preprocessing params: {final_preprocessing}")
             
-            # 5. Applica override manuali
-            print("🛠️ Step 5: Applicazione override manuali...")
+            # 6. Applica override manuali (solo su training params)
+            print("🛠️ Step 6: Applicazione override manuali...")
             applied_overrides = {}
             if manual_overrides:
-                print(f"🛠️ Applicando overrides: {manual_overrides}")
-                params.update(manual_overrides)
-                applied_overrides = manual_overrides.copy()
+                # Filtra solo training overrides
+                training_overrides = {k: v for k, v in manual_overrides.items() 
+                                    if k not in {'target_width','target_height', 'target_frames'}}
+                if training_overrides:
+                    print(f"🛠️ Applicando training overrides: {training_overrides}")
+                    training_params.update(training_overrides)
+                    applied_overrides = training_overrides.copy()
+                else:
+                    print("🛠️ Nessun training override valido")
             else:
                 print("🛠️ Nessun override manuale")
-            print(f"✅ Params dopo overrides: {params}")
+            print(f"✅ Training params dopo overrides: {training_params}")
             
-            # 6. Calcola parametri derivati (se presenti)
-            print("📊 Step 6: Calcolo parametri derivati...")
+            # 7. Calcola parametri derivati (se presenti)
+            print("📊 Step 7: Calcolo parametri derivati...")
             if config.post_calculation:
                 print("📊 Post calculation presente, eseguendo...")
-                calculated = self._calculate_derived_params(params, config.post_calculation)
-                params.update(calculated)
+                calculated = self._calculate_derived_params(training_params, config.post_calculation)
+                training_params.update(calculated)
                 print(f"✅ Parametri calcolati: {calculated}")
             else:
                 print("📊 Nessun post calculation configurato")
             
-            # 7. Valida parametri finali
-            print("✅ Step 7: Validazione parametri...")
-            self._validate_params(params, config.validation_rules)
+            # 8. Valida parametri finali
+            print("✅ Step 8: Validazione parametri...")
+            self._validate_params(training_params, config.validation_rules)
             print("✅ Validazione completata")
             
-            # 8. Pulisci parametri (arrotonda interi, etc.)
-            print("🧹 Step 8: Pulizia parametri...")
-            params = self._clean_params(params)
-            print(f"✅ Params finali puliti: {params}")
+            # 9. Pulisci parametri (arrotonda interi, etc.)
+            print("🧹 Step 9: Pulizia parametri...")
+            training_params = self._clean_params(training_params)
+            print(f"✅ Training params finali puliti: {training_params}")
             
-            # 9. Crea response semplificato
-            print("📦 Step 9: Creazione response...")
+            # 10. Crea response con separazione
+            print("📦 Step 10: Creazione response...")
             result = GeneratedParams(
                 algorithm_name=config.algorithm_name,
                 quality_level=quality_level,
                 gpu_memory_gb=gpu_memory_gb,
-                final_params=params,
+                final_params=training_params,  # 🎯 SOLO parametri di training
+                preprocessing_params=final_preprocessing,  # 🆕 Parametri preprocessing
                 applied_multipliers=hw_multipliers,
                 applied_overrides=applied_overrides,
-                estimated_training_time_minutes=self._estimate_training_time(params),
-                estimated_vram_usage_gb=self._estimate_vram_usage(params, gpu_memory_gb)
+                estimated_training_time_minutes=self._estimate_training_time(training_params),
+                estimated_vram_usage_gb=self._estimate_vram_usage(training_params, gpu_memory_gb)
             )
             
             print("🎉 === FINE generate_params - SUCCESSO ===")
-            print(f"🎉 Risultato finale: {result}")
+            print(f"🎉 Training params: {result.final_params}")
+            print(f"🎉 Preprocessing params: {result.preprocessing_params}")
             return result
             
         except Exception as e:
@@ -177,7 +192,7 @@ class TrainingParamsService:
             logger.error(f"❌ Errore caricamento configurazione {algorithm_name}: {e}")
             return None
     
-    # === METODI PRIVATI SEMPLIFICATI ===
+    # === METODI PRIVATI ===
     
     def _detect_gpu_memory(self) -> float:
         """Auto-rileva VRAM GPU"""
@@ -205,46 +220,56 @@ class TrainingParamsService:
         self, 
         base_params: Dict[str, Any], 
         quality_mults: Dict[str, float],
-        quality_overrides: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Applica moltiplicatori e override qualità"""
+        preprocessing_params: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Applica moltiplicatori training e carica preprocessing params
+        
+        Returns:
+            Tuple[training_params, preprocessing_params]
+        """
         
         result = base_params.copy()
         
-         # DEBUG: Log completo per capire cosa succede
         print(f"🔍 DEBUG _apply_quality_transforms:")
         print(f"  base_params: {base_params}")
         print(f"  quality_mults: {quality_mults}")
-        print(f"  quality_overrides: {quality_overrides}")
+        print(f"  preprocessing_params: {preprocessing_params}")
 
-        # Applica moltiplicatori
+        # Applica moltiplicatori solo su training params
         for param_name, multiplier in quality_mults.items():
             if param_name in result and isinstance(result[param_name], (int, float)):
                 result[param_name] = result[param_name] * multiplier
+                print(f"  ⚙️ Training multiplier: {param_name} *= {multiplier}")
         
-        # Applica override (sostituiscono, non moltiplicano)
-        result.update(quality_overrides)
-        print(f"  result finale: {result}")
+        print(f"  result finale (training): {result}")
+        print(f"  preprocessing_params finale: {preprocessing_params}")
 
-        return result
+        return result, preprocessing_params
     
     def _apply_hardware_scaling(
-    self, 
-    params: Dict[str, Any], 
-    hw_config: Any,
-    gpu_memory_gb: float,
-    quality_overrides: Optional[Dict[str, Any]] = None
-) -> Tuple[Dict[str, Any], Dict[str, float]]:
+        self, 
+        params: Dict[str, Any], 
+        hw_config: Any,
+        gpu_memory_gb: float,
+        preprocessing_params: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, float], Dict[str, Any]]:
+        """
+        Applica hardware scaling e gestisce target width e height
+        
+        Returns:
+            Tuple[training_params, applied_multipliers, final_preprocessing_params]
+        """
 
         result = params.copy()
         applied_multipliers = {}
+        final_preprocessing = preprocessing_params.copy()
 
-        # DEBUG: Log iniziale completo
         print(f"🔍 DEBUG _apply_hardware_scaling INIZIATO:")
         print(f"  GPU Memory: {gpu_memory_gb} GB")
         print(f"  Baseline VRAM: {hw_config.baseline_vram_gb} GB")
-        print(f"  Input params: {params}")
-        print(f"  Quality overrides: {quality_overrides}")
+        print(f"  Input training params: {params}")
+        print(f"  Input preprocessing_params: {preprocessing_params}")
 
         # Calcola vram_factor
         vram_factor = gpu_memory_gb / hw_config.baseline_vram_gb
@@ -255,11 +280,11 @@ class TrainingParamsService:
         for param_name, formula_config in hw_config.scaling_formulas.items():
             print(f"    - {param_name}: {formula_config.formula} (min={formula_config.min}, max={formula_config.max})")
 
-        # Applica formule scaling per ogni parametro
+        # Applica formule scaling SOLO ai training parameters
         for param_name, formula_config in hw_config.scaling_formulas.items():
-            print(f"  🔧 Processando parametro: {param_name}")
-            
             if param_name in result:
+                print(f"  🔧 Processando parametro training: {param_name}")
+                
                 original_value = result[param_name]
                 print(f"    ✅ Parametro trovato con valore: {original_value}")
                 
@@ -282,40 +307,40 @@ class TrainingParamsService:
                 else:
                     logger.warning(f"    ⚠️ Parametro non numerico: {result[param_name]} (tipo: {type(result[param_name])})")
             else:
-                logger.warning(f"    ❌ Parametro {param_name} NON TROVATO nei params")
+                logger.warning(f"    ❌ Parametro {param_name} NON TROVATO nei training params")
 
-        # Gestisci resolution con logica personalizzata
-        if "resolution" in result:
-            print(f"  🖼️ Gestendo resolution...")
+        # Gestisci target resolution con logica personalizzata
+        if "target_width" in final_preprocessing and "target_height" in final_preprocessing:
+            print(f"  🖼️ Gestendo target resolution...")
             
-            # Risoluzione indicata dal quality_override, se presente
-            quality_resolution = None
-            if quality_overrides and "resolution" in quality_overrides:
-                quality_resolution = quality_overrides["resolution"]
-                print(f"    Quality resolution da override: {quality_resolution}")
-            else:
-                quality_resolution = result["resolution"]
-                print(f"    Quality resolution da result: {quality_resolution}")
+            # Resolution indicata dal preprocessing params (quality mode)
+            quality_target_width = final_preprocessing["target_width"]
+            quality_target_height = final_preprocessing["target_height"]
+            print(f"    Quality target resolution: {quality_target_width}x{quality_target_height}")
+            
+            # Resolution massima permessa dalla VRAM
+            hw_max_width = self._determine_auto_resolution_width(hw_config.resolution_thresholds, gpu_memory_gb)
+            print(f"    HW max width calcolata: {hw_max_width}")
+            
+            # Prendi il valore più conservativo (width più bassa tra quality e hardware)
+            final_width = min(quality_target_width, hw_max_width)
+            
+            # Calcola l'height mantenendo l'aspect ratio del quality mode
+            aspect_ratio = quality_target_height / quality_target_width
+            final_height = int(final_width * aspect_ratio)
+            
+            final_preprocessing["target_width"] = final_width
+            final_preprocessing["target_height"] = final_height
+            
+            print(f"    ✅ Target resolution finale: {final_width}x{final_height}")
 
-            # Risoluzione massima permessa dalla VRAM
-            hw_resolution = self._determine_auto_resolution(hw_config.resolution_thresholds, gpu_memory_gb)
-            print(f"    HW resolution calcolata: {hw_resolution}")
+            print(f"  📋 RISULTATO FINALE:")
+            print(f"    Training params: {result}")
+            print(f"    Preprocessing params: {final_preprocessing}")
+            print(f"    Moltiplicatori applicati: {applied_multipliers}")
+            print(f"🏁 DEBUG _apply_hardware_scaling COMPLETATO")
 
-            # Se la resolution da quality è <= di quella hw, mantieni quality_resolution, altrimenti sostituisci
-            if hw_resolution <= quality_resolution :
-                result["resolution"] = quality_resolution
-                print(f"    ✅ Mantengo quality resolution: {quality_resolution}")
-            else:
-                result["resolution"] = hw_resolution
-                print(f"    🔧 Sostituisco con HW resolution: {hw_resolution}")
-
-        # DEBUG: Log finale
-        print(f"  📋 RISULTATO FINALE:")
-        print(f"    Parametri finali: {result}")
-        print(f"    Moltiplicatori applicati: {applied_multipliers}")
-        print(f"🏁 DEBUG _apply_hardware_scaling COMPLETATO")
-
-        return result, applied_multipliers
+            return result, applied_multipliers, final_preprocessing
 
     def _evaluate_safe_formula(
         self, 
@@ -522,15 +547,15 @@ class TrainingParamsService:
         
         return result
     
-    def _determine_auto_resolution(self, thresholds: list, gpu_memory_gb: float) -> int:
-        """Determina risoluzione automatica basata su VRAM"""
+    def _determine_auto_resolution_width(self, thresholds: list, gpu_memory_gb: float) -> int:
+        """Determina resolution scale factor automatico basato su VRAM"""
         sorted_thresholds = sorted(thresholds, key=lambda x: x.vram_threshold, reverse=True)
         
         for threshold in sorted_thresholds:
             if round(gpu_memory_gb) >= threshold.vram_threshold:
-                return threshold.resolution
+                return threshold.target_width
         
-        return 8  # Fallback conservativo
+        return 1280  # Fallback conservativo (risoluzione molto bassa)
     
     def _calculate_derived_params(
         self, 
@@ -645,35 +670,9 @@ class TrainingParamsService:
         return max(10, int(iterations / 500))
     
     def _estimate_vram_usage(self, params: Dict[str, Any], gpu_memory_gb: float) -> float:
-        """Stima uso VRAM"""
+        """Stima uso VRAM basato  su preprocessing_params"""
         base_usage = gpu_memory_gb * 0.8
-        resolution = params.get("resolution", 1)
-        resolution_factor = 1.0 / max(1, resolution)
-        return base_usage * resolution_factor
-    
-    # === METODI UTILITY ===
-    
-    def list_available_algorithms(self) -> list[str]:
-        """Lista algoritmi disponibili"""
-        try:
-            docs = list(self.db['training_params'].find({"active": True}, {"algorithm_name": 1}))
-            return [doc["algorithm_name"] for doc in docs]
-        except Exception as e:
-            logger.error(f"Errore caricamento algoritmi: {e}")
-            return []
-    
-    def get_algorithm_info(self, engine: Engine) -> Optional[Dict[str, Any]]:
-        """Ottieni info base algoritmo"""
-        config = self.get_config_by_engine(engine)
-        if not config:
-            return None
-        
-        return {
-            "algorithm_name": config.algorithm_name,
-            "display_name": config.display_name,
-            "version": config.version,
-            "description": config.metadata.description,
-            "min_gpu_memory_gb": config.metadata.min_gpu_memory_gb,
-            "available_quality_levels": list(config.quality_multipliers.keys()),
-            "parameter_count": len(config.base_params)
-        }
+        # Nota: resolution_scale_factor ora è in preprocessing_params, non in training params
+        # Questa funzione può essere semplificata o ricevere preprocessing_params come parametro
+        return base_usage * 0.8  # Stima conservativa
+ 

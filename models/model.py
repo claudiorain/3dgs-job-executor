@@ -15,6 +15,7 @@ class PhaseStatus(Enum):
 class Phase(Enum):
     FRAME_EXTRACTION = "frame_extraction"
     POINT_CLOUD_BUILDING = "point_cloud_building"
+    DEPTH_REGULARIZATION = "depth_regularization"
     TRAINING = "training"
     UPLOAD = "upload"
     METRICS = "metrics_evaluation"
@@ -28,6 +29,7 @@ class Engine(Enum):
 PHASE_TO_QUEUE = {
     Phase.FRAME_EXTRACTION: "frame_extraction_queue",
     Phase.POINT_CLOUD_BUILDING: "point_cloud_queue",
+    Phase.DEPTH_REGULARIZATION: "depth_regularization_queue",
     Phase.TRAINING: "model_training_queue",
     Phase.UPLOAD: "upload_queue",
     Phase.METRICS: "metrics_generation_queue"

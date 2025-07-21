@@ -24,6 +24,11 @@ phase_zip_helper = PhaseZipHelper()
 job_utils = JobUtils()
 
 
+quality_frame_targets = {
+    QualityLevel.FAST: 150,
+    QualityLevel.BALANCED: 200,
+    QualityLevel.QUALITY: 250,
+}
 
 # Cartella per i file di staging (zip delle fasi)
 S3_STAGING_PREFIX = os.getenv('S3_STAGING_PREFIX', 'staging')
@@ -105,126 +110,109 @@ class QueueJobService:
                 self.fail(model_id,"training",f"Error: No engine found in model {model_id}")
                 return False  
 
-            print(f"🔍 DEBUG: engine = {engine}")
-            print(f"🔍 DEBUG: quality_level = {quality_level}")
-            print(f"🔍 DEBUG: training_params_service type = {type(training_params_service)}")
-            print(f"🔍 DEBUG: Chiamando generate_params...")
-
-            generated_params = training_params_service.generate_params(Engine(engine),QualityLevel(quality_level))
-
+            generated_params = training_params_service.generate_params(Engine(engine), QualityLevel(quality_level))
             print(f"🔍 DEBUG: generate_params completato!")
             print(f"🔍 DEBUG: generated_params = {generated_params}")
-            # Calcola parametri ottimizzati
-            target_width = frame_extractor.calculate_target_width(local_video_path,generated_params.final_params['resolution'])
-            target_fps = frame_extractor.calculate_extraction_fps(local_video_path)
+
+            # 🆕 Usa preprocessing_params invece di final_params
+            target_width = generated_params.preprocessing_params.get('target_width', 1280)
+            target_height = generated_params.preprocessing_params.get('target_height', 720)
+            print(f"🔍 DEBUG: target_width = {target_width}")
+            print(f"🔍 DEBUG: target_height = {target_height}")
+            # Calcola parametri ottimizzati usando i preprocessing params
+            actual_width = frame_extractor.calculate_target_width(
+                local_video_path, 
+                target_width,target_height  # 🎯 Ora usa target_width e target_height da preprocessing_params
+            )
+
+            target_fps = frame_extractor.calculate_extraction_fps(
+                local_video_path, 
+                target_frame_count=200  # 🎯 Ora dinamico basato su qualità!
+            )
+
             print(f"Using FPS: {target_fps}")
-            print(f"Resizing images to: {target_width}")
+            print(f"Resizing images with width: {actual_width}")
 
-            with tempfile.TemporaryDirectory() as temp_sharp_output:
+            frames_output_folder = os.path.join(model_dir, 'input')
+            os.makedirs(frames_output_folder, exist_ok=True)
                 # 🆕 SHARP FRAMES CLI - Comando corretto
-                cmd = [
-                    "sharp-frames",
-                    local_video_path,
-                    temp_sharp_output,
-                    "--selection-method", "best-n",  # o "uniform"
-                    "--min-buffer", "3",  # o "uniform"
-                    "--num-frames" , str(250)
-                ]
-                # Aggiungi --width solo se necessario
-                if target_width is not None:
-                    cmd.extend(["--width", str(target_width)])
-
-                print(f"🔧 Running: {' '.join(cmd)}")
-            
-                try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    print(f"✅ Sharp-frames completed successfully")
-                    print(f"stdout: {result.stdout}")
-                except subprocess.CalledProcessError as e:
-                    print(f"❌ Sharp-frames failed with exit code {e.returncode}")
-                    print(f"📝 stdout: {e.stdout}")
-                    print(f"🔴 stderr: {e.stderr}")
-                    
-                    # Debug aggiuntivo
-                    print(f"🔍 Video file exists: {os.path.exists(local_video_path)}")
-                    print(f"🔍 Video file size: {os.path.getsize(local_video_path) if os.path.exists(local_video_path) else 'N/A'} bytes")
-                    print(f"🔍 Output dir exists: {os.path.exists(temp_sharp_output)}")
-                    print(f"🔍 Output dir writable: {os.access(temp_sharp_output, os.W_OK)}")
-            
-                    raise Exception(f"Sharp-frames error: {e.stderr}")
-            
-                print(f"✅ Sharp Frames output: {result.stdout}")
-                if result.stderr:
-                    print(f"⚠️ Sharp Frames warnings: {result.stderr}")       
-            
-                sharped_frames = sorted([
-                    f for f in os.listdir(temp_sharp_output)
-                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))
-                ])
-                print(f"📸 Frame generati da sharp-frames: {len(sharped_frames)}")
-                print(f"📂 Esempi frame: {sharped_frames[:5]}")
-                
-
-                frames_output_folder = os.path.join(model_dir, 'input')
-                os.makedirs(frames_output_folder, exist_ok=True)
-
-                filtered_count = frame_extractor.filter_similar_frames(
-                temp_sharp_output,
+            cmd = [
+                "sharp-frames",
+                local_video_path,
                 frames_output_folder,
-                similarity_threshold=0.80  # oppure 0.70 a seconda del tuo target
-                )
+                "--selection-method", "best-n",        # ✅ Ottimale per COLMAP
+                "--min-buffer", "1",                  # ✅ Minimal gap tra batch  
+                "--fps" , str(target_fps)
+            ]
+            # Aggiungi --width solo se necessario
+            if actual_width is not None:
+                cmd.extend(["--width", str(actual_width)])
 
-                # Conta i frame estratti
-                frame_files = []
-                if os.path.exists(frames_output_folder):
-                    for f in sorted(os.listdir(frames_output_folder)):
-                        if f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                            frame_files.append(os.path.join(frames_output_folder, f))
-                print(f"📊 Sharp frames extracted: {len(filtered_count)}")
+            print(f"🔧 Running: {' '.join(cmd)}")
+        
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                print(f"✅ Sharp-frames completed successfully")
+                print(f"stdout: {result.stdout}")
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Sharp-frames failed with exit code {e.returncode}")
+                print(f"📝 stdout: {e.stdout}")
+                print(f"🔴 stderr: {e.stderr}")
+            
+                raise Exception(f"Sharp-frames error: {e.stderr}")
+        
+            print(f"✅ Sharp Frames output: {result.stdout}")
+            if result.stderr:
+                print(f"⚠️ Sharp Frames warnings: {result.stderr}")       
+        
+            # Conta i frame estratti
+            frame_files = []
+            if os.path.exists(frames_output_folder):
+                for f in sorted(os.listdir(frames_output_folder)):
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        frame_files.append(os.path.join(frames_output_folder, f))
+            print(f"📊 Sharp frames extracted: {len(frame_files)}")
 
-                # Gestione thumbnail
-                thumbnail_path = frame_files[0] if frame_files else None
-                print(f"✅ Thumbnail local path: {thumbnail_path} and exists? " + str(os.path.exists(thumbnail_path) if thumbnail_path else False))
-                
-                
-                if thumbnail_path and os.path.exists(thumbnail_path):
-                    try:
-                        repository_service.upload(thumbnail_path, thumbnail_s3_key)
-                        print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
-                    except Exception as e:
-                        print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
-                        thumbnail_s3_key = None
+            # Gestione thumbnail
+            thumbnail_path = frame_files[0] if frame_files else None
+            print(f"✅ Thumbnail local path: {thumbnail_path} and exists? " + str(os.path.exists(thumbnail_path) if thumbnail_path else False))
+            
+            
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                try:
+                    repository_service.upload(thumbnail_path, thumbnail_s3_key)
+                    print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
+                except Exception as e:
+                    print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
+                    thumbnail_s3_key = None
 
-                # 📤 UPLOAD CARTELLA INPUT (FRAMES) SU S3
-                is_zip_uploaded =  phase_zip_helper.create_phase_zip_and_upload(model_id,model_dir,POINT_CLOUD_BUILDING_PHASE_ZIP_NAME,['input'])
-                if not is_zip_uploaded:
-                    self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
-                    return False
+            # 📤 UPLOAD CARTELLA INPUT (FRAMES) SU S3
+            is_zip_uploaded =  phase_zip_helper.create_phase_zip_and_upload(model_id,model_dir,POINT_CLOUD_BUILDING_PHASE_ZIP_NAME,['input'])
+            if not is_zip_uploaded:
+                self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
+                return False
 
-                # ✅ COMPLETE FASE con metadata
-                phase_metadata = {
-                    "frame_count": len(filtered_count),
-                    "video_local_path": local_video_path,  # Path del video per debug
-                    "video_size_mb": video_size / 1024 / 1024 if 'video_size' in locals() else None,
-                    "processing_params": {
-                        "outlier_window_size": 10,
-                        "outlier_sensitivity": 60,
-                        "selection_method": "outlier-removal",
-                        "fps": target_fps,
-                        "width": target_width
-                    }
+            # ✅ COMPLETE FASE con metadata
+            phase_metadata = {
+                "frame_count": len(frame_files),
+                "video_local_path": local_video_path,  # Path del video per debug
+                "video_size_mb": video_size / 1024 / 1024 if 'video_size' in locals() else None,
+                "processing_params": {
+                    "fps": target_fps,
+                    "width": target_width
                 }
+            }
 
-                model_service.complete_phase(model_id, "frame_extraction", 
-                                        metadata=phase_metadata)
-                
-                # Aggiorna il modello con thumbnail
-                if thumbnail_suffix:
-                    model_service.update_model_status(model_id, {
-                        "thumbnail_suffix": thumbnail_suffix  # ✅ A livello root del modello
-                    })
-                
-                return True
+            model_service.complete_phase(model_id, "frame_extraction", 
+                                    metadata=phase_metadata)
+            
+            # Aggiorna il modello con thumbnail
+            if thumbnail_suffix:
+                model_service.update_model_status(model_id, {
+                    "thumbnail_suffix": thumbnail_suffix  # ✅ A livello root del modello
+                })
+            
+            return True
             
         except Exception as e:
             print(f"❌ Error in frame extraction: {e}")
@@ -381,6 +369,19 @@ class QueueJobService:
             os.makedirs(train_output_folder, exist_ok=True)
             
             generated_params = training_params_service.generate_params(Engine(engine),QualityLevel(quality_level))
+           
+           # 📌 Aggiorna fase con i parametri di training PRIMA dell'esecuzione vera e propria
+            model_service.update_phase(
+                model_id,
+                "training",
+                metadata={
+                    "training_parameters": {
+                        "engine": engine,
+                        "quality_level": quality_level,
+                        "final_params": generated_params.final_params
+                    }
+                }
+            )
             # 4. Prepara richiesta di training
             train_request = {
                 "input_dir": model_dir,
@@ -417,11 +418,8 @@ class QueueJobService:
             phase_metadata = {
             "training_duration_seconds": round(training_duration_seconds, 2),
             "training_start_time": training_start_time.isoformat(),
-            "training_end_time": training_end_time.isoformat(),
-            "training_parameters": {
-                "engine": engine
+            "training_end_time": training_end_time.isoformat()
             }
-        }
 
             model_service.complete_phase(model_id, "training", 
                                    metadata=phase_metadata)
@@ -584,3 +582,62 @@ class QueueJobService:
         except Exception as e:
             self.fail(model_id,"metrics_evaluation",f"Fail to load model: {e}")
             return False  # Fallimento
+        
+    async def handle_depth_regularization(self, ch, method, model_id, data):
+        """
+        Fase 1.5: Generazione depth maps da frame estratti
+        """
+        model_service.start_phase(model_id, "depth_regularization")
+        model = model_service.get_model_by_id(model_id)
+        if not model:
+            self.fail(model_id, "depth_regularization", f"Error: No model found for model_id {model_id}")
+            return False
+        
+        model_dir = os.path.join(WORKING_DIR, f"{model_id}")
+        input_dir = os.path.join(model_dir, 'input')
+        
+        try:
+            # 1. Verifica che la directory input esista
+            if os.path.exists(input_dir) and os.listdir(input_dir):
+                print(f"✅ Directory input già esistente per model_id {model_id}")
+            else:
+                print(f"📥 Scaricando directory input da S3 per model_id {model_id}")
+                os.makedirs(model_dir, exist_ok=True)
+                
+                # Scarica ZIP della fase frame extraction
+                training_zip_s3_key = f"{S3_STAGING_PREFIX}/{model.parent_model_id}/{TRAINING_PHASE_ZIP_NAME}"
+                success = phase_zip_helper.download_and_extract_phase_zip(training_zip_s3_key, model_dir)
+                
+                if not success:
+                    self.fail(model_id, "depth_regularization", 
+                            f"Failed to download/extract frames ZIP from {training_zip_s3_key}")
+                    return False
+                        
+            # 4. Genera depth maps usando Depth Anything V2
+            print(f"🔄 Avvio generazione depth maps per model_id {model_id}...")
+            depth_start_time = datetime.utcnow()
+            engine = model.training_config.get('engine') if model.training_config else 'INRIA'
+
+            depth_request = { "input_dir": model_dir}
+            response = requests.post(engine_map.get(engine).get('api-url') + "/depth_regularization", json=depth_request)
+            response.raise_for_status()  # Controlla che non ci siano errori nel render
+            depth_end_time = datetime.utcnow()
+
+            depth_duration = depth_end_time - depth_start_time
+            depth_duration_seconds = depth_duration.total_seconds()
+            # 9. Metadata della fase
+            phase_metadata = {
+                "depth_regularization_duration_seconds": round(depth_duration_seconds, 2),
+                "depth_start_time": depth_start_time.isoformat(),
+                "depth_end_time": depth_end_time.isoformat(),
+            }
+            
+            model_service.complete_phase(model_id, "depth_regularization", metadata=phase_metadata)
+            
+            print(f"✅ Depth generation completed successfully for model_id {model_id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error in depth generation: {e}")
+            self.fail(model_id, "depth_regularization", f"Depth generation failed: {e}")
+            return False

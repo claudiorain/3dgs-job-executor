@@ -60,6 +60,23 @@ class ModelService:
 
         return result
     
+    def update_phase(self, model_id: UUID, phase: str, metadata: dict):
+        """
+        Aggiorna il metadata di una fase senza modificarne lo stato.
+
+        :param model_id: UUID del modello
+        :param phase: Nome della fase (es: "training", "colmap", ecc.)
+        :param metadata: Dizionario di dati da salvare sotto phases.<phase>
+        """
+        update_fields = {
+            "updated_at": datetime.utcnow()
+        }
+
+        for key, value in metadata.items():
+            update_fields[f"phases.{phase}.{key}"] = value
+
+        return self.update_model_status(model_id, update_fields)
+
     def start_phase(self, model_id: UUID, phase: str):
         """
         Helper per avviare una fase: aggiorna started_at e status RUNNING
