@@ -13,7 +13,6 @@ from services.queue_job_consumer_service import QueueJobService
 queues = [
             'frame_extraction_queue',
             'point_cloud_queue',
-            'depth_regularization_queue',
             'model_training_queue',
             'upload_queue',
             'metrics_generation_queue'
@@ -108,10 +107,6 @@ class SequentialJobProcessor:
                 
             elif method.routing_key == "point_cloud_queue":
                 success = await self.job_service.handle_point_cloud_building(ch, method,model_id, data)
-                next_queue = "depth_regularization_queue" if success else None
-            
-            elif method.routing_key == "depth_regularization_queue":  # 🆕 
-                success = await self.job_service.handle_depth_regularization(ch, method, model_id, data)
                 next_queue = "model_training_queue" if success else None
 
             elif method.routing_key == "model_training_queue":

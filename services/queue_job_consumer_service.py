@@ -358,8 +358,22 @@ class QueueJobService:
                 return False
             
             
+            print(f"🎯 Starting training with engine: {engine}")
+            training_start_time = datetime.utcnow()
+
             engine = model.training_config.get('engine') if model.training_config else None
             quality_level = model.training_config.get('quality_level') if model.training_config else None
+
+            api_url = engine_map.get(engine, {}).get('api-url')
+            if not api_url:
+                self.fail(model_id,"training",f"Error: No api url found for engine {engine}")
+                return False
+
+            depth_request = { "input_dir": model_dir}
+            response = requests.post(f"{api_url}/depth_regularization", json=depth_request)
+            response.raise_for_status()  # Controlla che non ci siano errori nel render
+            
+
             if not engine:
                 self.fail(model_id,"training",f"Error: No engine found in model {model_id}")
                 return False
@@ -388,15 +402,6 @@ class QueueJobService:
                 "output_dir": train_output_folder,
                 "params": generated_params.final_params,
             }
-            
-            # 5. Chiamata API per il training
-            api_url = engine_map.get(engine, {}).get('api-url')
-            if not api_url:
-                self.fail(model_id,"training",f"Error: No api url found for engine {engine}")
-                return False
-            
-            print(f"🎯 Starting training with engine: {engine}")
-            training_start_time = datetime.utcnow()
         
             # TRAIN API call
             response = requests.post(f"{api_url}/train", json=train_request)
@@ -583,61 +588,4 @@ class QueueJobService:
             self.fail(model_id,"metrics_evaluation",f"Fail to load model: {e}")
             return False  # Fallimento
         
-    async def handle_depth_regularization(self, ch, method, model_id, data):
-        """
-        Fase 1.5: Generazione depth maps da frame estratti
-        """
-        model_service.start_phase(model_id, "depth_regularization")
-        model = model_service.get_model_by_id(model_id)
-        if not model:
-            self.fail(model_id, "depth_regularization", f"Error: No model found for model_id {model_id}")
-            return False
-        
-        model_dir = os.path.join(WORKING_DIR, f"{model_id}")
-        input_dir = os.path.join(model_dir, 'input')
-        
-        try:
-            # 1. Verifica che la directory input esista
-            if os.path.exists(input_dir) and os.listdir(input_dir):
-                print(f"✅ Directory input già esistente per model_id {model_id}")
-            else:
-                print(f"📥 Scaricando directory input da S3 per model_id {model_id}")
-                os.makedirs(model_dir, exist_ok=True)
-                
-                # Scarica ZIP della fase frame extraction
-                training_zip_s3_key = f"{S3_STAGING_PREFIX}/{model.parent_model_id}/{TRAINING_PHASE_ZIP_NAME}"
-                success = phase_zip_helper.download_and_extract_phase_zip(training_zip_s3_key, model_dir)
-                
-                if not success:
-                    self.fail(model_id, "depth_regularization", 
-                            f"Failed to download/extract frames ZIP from {training_zip_s3_key}")
-                    return False
-                        
-            # 4. Genera depth maps usando Depth Anything V2
-            print(f"🔄 Avvio generazione depth maps per model_id {model_id}...")
-            depth_start_time = datetime.utcnow()
-            engine = model.training_config.get('engine') if model.training_config else 'INRIA'
-
-            depth_request = { "input_dir": model_dir}
-            response = requests.post(engine_map.get(engine).get('api-url') + "/depth_regularization", json=depth_request)
-            response.raise_for_status()  # Controlla che non ci siano errori nel render
-            depth_end_time = datetime.utcnow()
-
-            depth_duration = depth_end_time - depth_start_time
-            depth_duration_seconds = depth_duration.total_seconds()
-            # 9. Metadata della fase
-            phase_metadata = {
-                "depth_regularization_duration_seconds": round(depth_duration_seconds, 2),
-                "depth_start_time": depth_start_time.isoformat(),
-                "depth_end_time": depth_end_time.isoformat(),
-            }
-            
-            model_service.complete_phase(model_id, "depth_regularization", metadata=phase_metadata)
-            
-            print(f"✅ Depth generation completed successfully for model_id {model_id}")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error in depth generation: {e}")
-            self.fail(model_id, "depth_regularization", f"Depth generation failed: {e}")
-            return False
+    
