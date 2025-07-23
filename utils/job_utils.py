@@ -49,3 +49,34 @@ class JobUtils:
             print(f"❌ No iteration folders found")
             return None
 
+    def get_colmap_reconstruction_stats(model_dir):
+        """
+        Raccoglie il numero di punti 3D dalla ricostruzione COLMAP
+        """
+        import struct
+        
+        sparse_path = os.path.join(model_dir, "sparse", "0")
+        points_3d = 0
+        
+        # Conta punti 3D
+        points_bin = os.path.join(sparse_path, "points3D.bin")
+        points_txt = os.path.join(sparse_path, "points3D.txt")
+        
+        if os.path.exists(points_bin):
+            try:
+                with open(points_bin, 'rb') as f:
+                    points_3d = struct.unpack('<Q', f.read(8))[0]
+            except:
+                pass
+        elif os.path.exists(points_txt):
+            try:
+                with open(points_txt, 'r') as f:
+                    count = 0
+                    for line in f:
+                        if line.strip() and not line.startswith('#'):
+                            count += 1
+                    points_3d = count
+            except:
+                pass
+        
+        return points_3d

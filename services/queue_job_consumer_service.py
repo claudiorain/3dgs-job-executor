@@ -299,6 +299,10 @@ class QueueJobService:
          
         print(f"✅ Nuvola di punti generata con successo per model_id {model_id}")
 
+        # 🆕 RACCOGLI STATISTICHE COLMAP
+        generated_points = job_utils.get_colmap_reconstruction_stats(model_dir)
+        print(f"📊 COLMAP Stats: {generated_points}")
+
         is_zip_uploaded = phase_zip_helper.create_phase_zip_and_upload(model_id,model_dir,TRAINING_PHASE_ZIP_NAME,['sparse', 'images'])
         if not is_zip_uploaded:
              self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
@@ -307,6 +311,7 @@ class QueueJobService:
         # 7. Aggiorna stato e passa alla fase successiva
         phase_metadata = {
             "input_frame_count": input_frame_count,
+            "colmap_points_3d": generated_points,
             "colmap_duration_seconds": round(colmap_duration_seconds, 2),
             "colmap_start_time": colmap_start_time.isoformat(),
             "colmap_end_time": colmap_end_time.isoformat(),
@@ -358,20 +363,22 @@ class QueueJobService:
                 return False
             
             
-            print(f"🎯 Starting training with engine: {engine}")
+           
             training_start_time = datetime.utcnow()
 
             engine = model.training_config.get('engine') if model.training_config else None
             quality_level = model.training_config.get('quality_level') if model.training_config else None
-
+            
+            print(f"🎯 Starting training with engine: {engine}")
             api_url = engine_map.get(engine, {}).get('api-url')
             if not api_url:
                 self.fail(model_id,"training",f"Error: No api url found for engine {engine}")
                 return False
 
-            depth_request = { "input_dir": model_dir}
-            response = requests.post(f"{api_url}/depth_regularization", json=depth_request)
-            response.raise_for_status()  # Controlla che non ci siano errori nel render
+            if engine == 'INRIA':
+                depth_request = { "input_dir": model_dir}
+                response = requests.post(f"{api_url}/depth_regularization", json=depth_request)
+                response.raise_for_status()  # Controlla che non ci siano errori nel render
             
 
             if not engine:
