@@ -132,7 +132,7 @@ class SequentialJobProcessor:
         except Exception as e:
             print(f"❌ Errore durante l'elaborazione del job: {e}")
             if 'model_id' in locals() and model_id:
-                self.model_service.update_model_status(model_id, {"status": "ERROR", "error_message": str(e)})
+                self.model_service.update_model_status(model_id, {"overall_status": "FAILED", "error_message": str(e)})
             # Conferma comunque il messaggio per evitare di bloccarsi su messaggi problematici
             ch.basic_ack(delivery_tag=method.delivery_tag)
             print("Job fallito, conferma del messaggio alla coda.")

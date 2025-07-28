@@ -1,4 +1,4 @@
-from config.message_queue import get_connection,get_channel,close_connection  # Assicurati che questa funzione restituisca il client del database
+from config.message_queue import get_connection,get_channel  # Assicurati che questa funzione restituisca il client del database
 from services.model_service import ModelService
 from services.repository_service import RepositoryService
 from services.training_params_service import TrainingParamsService,QualityLevel
@@ -67,161 +67,152 @@ class QueueJobService:
         
     async def handle_frame_extraction(self, ch, method, model_id, data):
         """
-        Fase 1: Download del video e creazione dei fotogrammi con preprocessing SAM2
+        Fase 1: Download del video e creazione dei fotogrammi con preprocessing atomico
+        REFACTORED: Utilizza VideoFrameExtractionService per operazioni atomiche
         """
+        from services.video_frame_extraction_service import (
+            VideoFrameExtractionService, 
+            FrameExtractionParams
+        )
+        
         model_service.start_phase(model_id, "frame_extraction")
         model = model_service.get_model_by_id(model_id)
+        
         if not model:
-            self.fail(model_id,"frame_extraction",f"Error: No model found for model_id {model_id}")
+            self.fail(model_id, "frame_extraction", f"Error: No model found for model_id {model_id}")
             return False  
                     
         video_s3_key = model.video_s3_key
         if not video_s3_key:
-            self.fail(model_id,"frame_extraction",f"Error: No video_s3_key found for model_id {model_id}")
+            self.fail(model_id, "frame_extraction", f"Error: No video_s3_key found for model_id {model_id}")
             return False  
                     
         model_dir = os.path.join(WORKING_DIR, f"{model_id}")
         os.makedirs(model_dir, exist_ok=True)
 
-        # 🚀 RIMOZIONE TEMPFILE - Usa percorso fisso per sfruttare la cache
+        # Percorso fisso per sfruttare la cache
         local_video_path = os.path.join(model_dir, 'input_video.mp4')
+        frames_output_folder = os.path.join(model_dir, 'input')
         
         try:
-            # Il repository_service.download() gestisce già la cache internamente!
-            # ✅ Se in cache: copia dalla cache al percorso locale
-            # ⬇️ Se non in cache: scarica da S3 e copia in cache
+            # ===== STEP 1: DOWNLOAD VIDEO =====
+            print(f"📥 Downloading video from S3: {video_s3_key}")
             repository_service.download(video_s3_key, local_video_path)
                         
-            thumbnail_suffix = f"thumbnail.jpg"
-            thumbnail_s3_key = f"{S3_DELIVERY_PREFIX}/{model_id}/{thumbnail_suffix}"
-            
-            print(f"📽️ Processing video from: {local_video_path}")
-            
-            # Verifica che il video sia stato scaricato correttamente
+            # Verifica download
             if not os.path.exists(local_video_path):
                 raise Exception(f"Video file not found after download: {local_video_path}")
             
             video_size = os.path.getsize(local_video_path)
-            print(f"📊 Video size: {video_size / 1024 / 1024:.2f} MB")
+            print(f"📊 Video downloaded successfully: {video_size / 1024 / 1024:.2f} MB")
             
+            # ===== STEP 2: RECUPERO PARAMETRI DI CONFIGURAZIONE =====
             engine = model.training_config.get('engine') if model.training_config else None
             quality_level = model.training_config.get('quality_level') if model.training_config else None
+            
             if not engine:
-                self.fail(model_id,"training",f"Error: No engine found in model {model_id}")
+                self.fail(model_id, "frame_extraction", f"Error: No engine found in model {model_id}")
                 return False  
 
+            # Genera parametri ottimizzati per engine e hardware
             generated_params = training_params_service.generate_params(Engine(engine), QualityLevel(quality_level))
-            print(f"🔍 DEBUG: generate_params completato!")
-            print(f"🔍 DEBUG: generated_params = {generated_params}")
-
-            # 🆕 Usa preprocessing_params invece di final_params
+            print(f"🎯 Generated training parameters completed")
+            
+            # Estrai preprocessing_params per frame extraction
             target_width = generated_params.preprocessing_params.get('target_width', 1280)
             target_height = generated_params.preprocessing_params.get('target_height', 720)
-            print(f"🔍 DEBUG: target_width = {target_width}")
-            print(f"🔍 DEBUG: target_height = {target_height}")
-            # Calcola parametri ottimizzati usando i preprocessing params
-            actual_width = frame_extractor.calculate_target_width(
-                local_video_path, 
-                target_width,target_height  # 🎯 Ora usa target_width e target_height da preprocessing_params
+            target_frame_count = generated_params.preprocessing_params.get('target_frames', 200)
+            
+            print(f"🔍 Frame extraction config - Width: {target_width}, Height: {target_height}, Frames: {target_frame_count}")
+            
+            # ===== STEP 3: ESTRAZIONE ATOMICA DEI FRAME =====
+            print(f"🎬 Starting atomic frame extraction...")
+            
+            # Inizializza il service di estrazione
+            frame_extraction_service = VideoFrameExtractionService()
+            
+            # Configura parametri di estrazione
+            extraction_params = FrameExtractionParams(
+                target_width=target_width,
+                target_height=target_height,
+                target_frame_count=target_frame_count,
+                selection_method="best-n",  # Ottimale per COLMAP
+                min_buffer="1"  # Gap minimale tra frame consecutivi
             )
-
-            target_fps = frame_extractor.calculate_extraction_fps(
-                local_video_path, 
-                target_frame_count=200  # 🎯 Ora dinamico basato su qualità!
+            
+            # Esecuzione atomica dell'estrazione
+            extraction_result = frame_extraction_service.extract_frames(
+                video_path=local_video_path,
+                output_directory=frames_output_folder,
+                extraction_params=extraction_params
             )
-
-            print(f"Using FPS: {target_fps}")
-            print(f"Resizing images with width: {actual_width}")
-
-            frames_output_folder = os.path.join(model_dir, 'input')
-            os.makedirs(frames_output_folder, exist_ok=True)
-                # 🆕 SHARP FRAMES CLI - Comando corretto
-            cmd = [
-                "sharp-frames",
-                local_video_path,
-                frames_output_folder,
-                "--selection-method", "best-n",        # ✅ Ottimale per COLMAP
-                "--min-buffer", "1",                  # ✅ Minimal gap tra batch  
-                "--fps" , str(target_fps)
-            ]
-            # Aggiungi --width solo se necessario
-            if actual_width is not None:
-                cmd.extend(["--width", str(actual_width)])
-
-            print(f"🔧 Running: {' '.join(cmd)}")
-        
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                print(f"✅ Sharp-frames completed successfully")
-                print(f"stdout: {result.stdout}")
-            except subprocess.CalledProcessError as e:
-                print(f"❌ Sharp-frames failed with exit code {e.returncode}")
-                print(f"📝 stdout: {e.stdout}")
-                print(f"🔴 stderr: {e.stderr}")
             
-                raise Exception(f"Sharp-frames error: {e.stderr}")
-        
-            print(f"✅ Sharp Frames output: {result.stdout}")
-            if result.stderr:
-                print(f"⚠️ Sharp Frames warnings: {result.stderr}")       
-        
-            # Conta i frame estratti
-            frame_files = []
-            if os.path.exists(frames_output_folder):
-                for f in sorted(os.listdir(frames_output_folder)):
-                    if f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        frame_files.append(os.path.join(frames_output_folder, f))
-            print(f"📊 Sharp frames extracted: {len(frame_files)}")
-
-            # Gestione thumbnail
-            thumbnail_path = frame_files[0] if frame_files else None
-            print(f"✅ Thumbnail local path: {thumbnail_path} and exists? " + str(os.path.exists(thumbnail_path) if thumbnail_path else False))
+            # Verifica successo operazione atomica
+            if not extraction_result.success:
+                raise Exception(f"Frame extraction failed: {extraction_result.error_message}")
             
+            print(f"✅ Atomic frame extraction completed: {extraction_result.extracted_frame_count} frames")
             
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                try:
-                    repository_service.upload(thumbnail_path, thumbnail_s3_key)
-                    print(f"✅ Thumbnail caricata su S3: {thumbnail_s3_key}")
-                except Exception as e:
-                    print(f"❌ Errore durante l'upload della thumbnail su S3: {e}")
-                    thumbnail_s3_key = None
+            # ===== STEP 4: GESTIONE THUMBNAIL =====
+            thumbnail_suffix = "thumbnail.jpg"
+            thumbnail_s3_key = f"{S3_DELIVERY_PREFIX}/{model_id}/{thumbnail_suffix}"
+            
+            # Usa il primo frame come thumbnail
+            if extraction_result.frame_files:
+                thumbnail_path = extraction_result.frame_files[0]
+                print(f"📸 Using first frame as thumbnail: {thumbnail_path}")
+                
+                if os.path.exists(thumbnail_path):
+                    try:
+                        repository_service.upload(thumbnail_path, thumbnail_s3_key)
+                        print(f"✅ Thumbnail uploaded to S3: {thumbnail_s3_key}")
+                    except Exception as e:
+                        print(f"❌ Error uploading thumbnail: {e}")
+                        thumbnail_suffix = None
+                else:
+                    print(f"⚠️ Thumbnail file not found: {thumbnail_path}")
+                    thumbnail_suffix = None
+            else:
+                print(f"⚠️ No frames available for thumbnail")
+                thumbnail_suffix = None
 
-            # 📤 UPLOAD CARTELLA INPUT (FRAMES) SU S3
-            is_zip_uploaded =  phase_zip_helper.create_phase_zip_and_upload(model_id,model_dir,POINT_CLOUD_BUILDING_PHASE_ZIP_NAME,['input'])
+            # ===== STEP 5: UPLOAD FASE INTERMEDIA SU S3 =====
+            print(f"📤 Uploading frame extraction results to S3...")
+            is_zip_uploaded = phase_zip_helper.create_phase_zip_and_upload(
+                model_id, model_dir, POINT_CLOUD_BUILDING_PHASE_ZIP_NAME, ['input']
+            )
+            
             if not is_zip_uploaded:
-                self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
+                self.fail(model_id, "frame_extraction", f"Error: Failed to create phase ZIP for model_id {model_id}")
                 return False
 
-            # ✅ COMPLETE FASE con metadata
+            # ===== STEP 6: COMPLETAMENTO FASE CON METADATI =====
             phase_metadata = {
-                "frame_count": len(frame_files),
-                "video_local_path": local_video_path,  # Path del video per debug
-                "video_size_mb": video_size / 1024 / 1024 if 'video_size' in locals() else None,
-                "processing_params": {
-                    "fps": target_fps,
-                    "width": target_width
-                }
+                "frame_count": extraction_result.extracted_frame_count,
+                "video_size_mb": video_size / 1024 / 1024,
+                "extraction_parameters": extraction_result.extraction_params,
+                "processing_stats": extraction_result.processing_stats,
+                "extraction_service_version": "atomic_v1.0"
             }
 
-            model_service.complete_phase(model_id, "frame_extraction", 
-                                    metadata=phase_metadata)
+            model_service.complete_phase(model_id, "frame_extraction", metadata=phase_metadata)
             
-            # Aggiorna il modello con thumbnail
+            # Aggiorna thumbnail nel modello se disponibile
             if thumbnail_suffix:
                 model_service.update_model_status(model_id, {
-                    "thumbnail_suffix": thumbnail_suffix  # ✅ A livello root del modello
+                    "thumbnail_suffix": thumbnail_suffix
                 })
             
+            print(f"✅ Frame extraction phase completed successfully")
             return True
             
         except Exception as e:
-            print(f"❌ Error in frame extraction: {e}")
+            print(f"❌ Error in frame extraction handler: {e}")
             self.fail(model_id, "frame_extraction", f"Frame extraction failed: {e}")
             return False
         
         finally:
-            # 🧹 CLEANUP OPZIONALE - Rimuovi il video locale dopo il processing
-            # (mantieni solo se serve per debug, altrimenti risparmia spazio disco)
+            # ===== CLEANUP =====
             try:
                 if os.path.exists(local_video_path):
                     os.remove(local_video_path)
@@ -230,97 +221,104 @@ class QueueJobService:
                 print(f"⚠️ Warning: Could not cleanup video file: {e}")
 
     async def handle_point_cloud_building(self, ch, method, model_id, data):
-        """Fase 2: Creazione del punto nuvola tramite Gaussian Splatting"""
-        model_service.start_phase(model_id, "point_cloud_building")
-        model = model_service.get_model_by_id(model_id)
-        if not model:
-            self.fail(model_id,"point_cloud_building",f"Error: No model found for model_id {model_id}")
-            return False
-        
-        # 🆕 Salva backup delle immagini segmentate PRIMA di COLMAP
-        model_dir = os.path.join(WORKING_DIR, f"{model_id}")
-        input_dir = os.path.join(model_dir, 'input')
-
-        if os.path.exists(input_dir) and os.listdir(input_dir):
-            print(f"✅ Directory input già esistente per model_id {model_id}")
-        else:
-            print(f"📥 Scaricando directory input da S3 per model_id {model_id}")
-            # Crea directory se non esiste
-            os.makedirs(model_dir, exist_ok=True)
-
-            # Ottieni il percorso S3 del ZIP della fase point cloud building
-            point_cloud_zip_s3_key = f"{S3_STAGING_PREFIX}/{model.parent_model_id}/{POINT_CLOUD_BUILDING_PHASE_ZIP_NAME}"
-
-            # Scarica ed estrai lo ZIP
-            success = phase_zip_helper.download_and_extract_phase_zip(point_cloud_zip_s3_key, model_dir)
-
-            if not success:
-                self.fail(model_id, "point_cloud_building", 
-                         f"Failed to download/extract point cloud building ZIP from {point_cloud_zip_s3_key}")
+       
+        try: 
+            """Fase 2: Creazione del punto nuvola tramite Gaussian Splatting"""
+            model_service.start_phase(model_id, "point_cloud_building")
+            model = model_service.get_model_by_id(model_id)
+            if not model:
+                self.fail(model_id,"point_cloud_building",f"Error: No model found for model_id {model_id}")
                 return False
             
-             # Verifica nuovamente che l'estrazione sia andata a buon fine
-            if not os.path.exists(input_dir):
-                self.fail(model_id, "point_cloud_building", 
-                         f"Input directory is still invalid after ZIP extraction")
-                return False
-           
-        # 2. Conta frame di input per metadata
-        frame_files = [f for f in os.listdir(input_dir) 
-                      if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        input_frame_count = len(frame_files)
+            # 🆕 Salva backup delle immagini segmentate PRIMA di COLMAP
+            model_dir = os.path.join(WORKING_DIR, f"{model_id}")
+            input_dir = os.path.join(model_dir, 'input')
 
-        # Cartella sparse per la point cloud
-        sparse_dir = os.path.join(model_dir, 'sparse')
+            if os.path.exists(input_dir) and os.listdir(input_dir):
+                print(f"✅ Directory input già esistente per model_id {model_id}")
+            else:
+                print(f"📥 Scaricando directory input da S3 per model_id {model_id}")
+                # Crea directory se non esiste
+                os.makedirs(model_dir, exist_ok=True)
 
+                # Ottieni il percorso S3 del ZIP della fase point cloud building
+                point_cloud_zip_s3_key = f"{S3_STAGING_PREFIX}/{model.parent_model_id}/{POINT_CLOUD_BUILDING_PHASE_ZIP_NAME}"
 
-        print(f"Generando la nuvola di punti per model_id {model_id}...")
+                # Scarica ed estrai lo ZIP
+                success = phase_zip_helper.download_and_extract_phase_zip(point_cloud_zip_s3_key, model_dir)
+
+                if not success:
+                    self.fail(model_id, "point_cloud_building", 
+                            f"Failed to download/extract point cloud building ZIP from {point_cloud_zip_s3_key}")
+                    return False
+                
+                # Verifica nuovamente che l'estrazione sia andata a buon fine
+                if not os.path.exists(input_dir):
+                    self.fail(model_id, "point_cloud_building", 
+                            f"Input directory is still invalid after ZIP extraction")
+                    return False
             
-        print(f"🔄 Avvio generazione point cloud per model_id {model_id}...")
-        colmap_start_time = datetime.utcnow()
-        
-        # COLMAP API call
-        convert_request = {"input_dir": model_dir}
-        response = requests.post(COLMAP_API_URL + "/convert", json=convert_request)
-        
-        # ⏱️ FINE TIMING COLMAP
-        colmap_end_time = datetime.utcnow()
-        colmap_duration = colmap_end_time - colmap_start_time
-        colmap_duration_seconds = colmap_duration.total_seconds()
+            # Cartella sparse per la point cloud
+            sparse_dir = os.path.join(model_dir, 'sparse')
+
+
+            print(f"Generando la nuvola di punti per model_id {model_id}...")
+                
+            print(f"🔄 Avvio generazione point cloud per model_id {model_id}...")
+            colmap_start_time = datetime.utcnow()
             
-        if response.status_code != 200:
-            self.fail(model_id,"point_cloud_building",f" Colmap error: {response.text}")
-            return False
-        
-        # 5. Verifica che COLMAP abbia creato i file
-        if not os.path.exists(sparse_dir) or not os.listdir(sparse_dir):
-            self.fail(model_id,"point_cloud_building",f"Error: no cloud point created for model_id {model_id}")
-            return False   
-         
-        print(f"✅ Nuvola di punti generata con successo per model_id {model_id}")
+            # COLMAP API call
+            convert_request = {"input_dir": model_dir}
+            response = requests.post(COLMAP_API_URL + "/convert", json=convert_request)
 
-        # 🆕 RACCOGLI STATISTICHE COLMAP
-        generated_points = job_utils.get_colmap_reconstruction_stats(model_dir)
-        print(f"📊 COLMAP Stats: {generated_points}")
-
-        is_zip_uploaded = phase_zip_helper.create_phase_zip_and_upload(model_id,model_dir,TRAINING_PHASE_ZIP_NAME,['sparse', 'images'])
-        if not is_zip_uploaded:
-             self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
-             return False
-
-        # 7. Aggiorna stato e passa alla fase successiva
-        phase_metadata = {
-            "input_frame_count": input_frame_count,
-            "colmap_points_3d": generated_points,
-            "colmap_duration_seconds": round(colmap_duration_seconds, 2),
-            "colmap_start_time": colmap_start_time.isoformat(),
-            "colmap_end_time": colmap_end_time.isoformat(),
-        }
-
-        model_service.complete_phase(model_id, "point_cloud_building", 
-                                   metadata=phase_metadata)
+            response_json = response.json()
+            reconstruction_params = response_json.get("reconstruction_params", {})
+            print(f"🔍 Extracted reconstruction_params: {reconstruction_params}")
     
-        return True
+            # 🆕 RACCOGLI STATISTICHE COLMAP
+            reconstruction_params["generated_points"] = job_utils.get_colmap_reconstruction_stats(model_dir)
+    
+            print(f"🔍 Final reconstruction_params after adding generated_points: {reconstruction_params}")
+
+            # ⏱️ FINE TIMING COLMAP
+            colmap_end_time = datetime.utcnow()
+            colmap_duration = colmap_end_time - colmap_start_time
+            colmap_duration_seconds = colmap_duration.total_seconds()
+                
+            if response.status_code != 200:
+                self.fail(model_id,"point_cloud_building",f" Colmap error: {response.text}")
+                return False
+            
+            # 5. Verifica che COLMAP abbia creato i file
+            if not os.path.exists(sparse_dir) or not os.listdir(sparse_dir):
+                self.fail(model_id,"point_cloud_building",f"Error: no cloud point created for model_id {model_id}")
+                return False   
+            
+            print(f"✅ Nuvola di punti generata con successo per model_id {model_id}")
+
+           
+            print(f"📊 COLMAP Stats: {reconstruction_params}")
+
+            is_zip_uploaded = phase_zip_helper.create_phase_zip_and_upload(model_id,model_dir,TRAINING_PHASE_ZIP_NAME,['sparse', 'images'])
+            if not is_zip_uploaded:
+                self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
+                return False
+
+            # 7. Aggiorna stato e passa alla fase successiva
+            phase_metadata = {
+                "reconstruction_params": reconstruction_params,
+                "colmap_duration_seconds": round(colmap_duration_seconds, 2),
+                "colmap_start_time": colmap_start_time.isoformat(),
+                "colmap_end_time": colmap_end_time.isoformat(),
+            }
+
+            model_service.complete_phase(model_id, "point_cloud_building", 
+                                    metadata=phase_metadata)
+        
+            return True
+        except Exception as e:
+            self.fail(model_id,"training",f"Training error: {e}")
+            return False
 
     async def handle_training(self, ch, method, model_id, data):
         print(f"🚀 Start training model {model_id}")
@@ -391,6 +389,46 @@ class QueueJobService:
             
             generated_params = training_params_service.generate_params(Engine(engine),QualityLevel(quality_level))
            
+            # 🆕 STIMA GAUSSIANE BASATA SUI PARAMETRI DI RICOSTRUZIONE
+            if engine == 'MCMC' or engine == 'TAMING':
+                try:
+                    # Estrai i parametri di ricostruzione dalla fase point_cloud_building
+                    reconstruction_params = model.phases.get('point_cloud_building', {}).metadata['reconstruction_params']
+                    
+                    if reconstruction_params and 'generated_points' in reconstruction_params:
+                        # Usa la formula semplice (più affidabile)
+                        estimated_gaussians = JobUtils.estimate_final_gaussians(reconstruction_params['generated_points'])
+                        
+                        print(f"📊 Estimated gaussians: {estimated_gaussians:,} based on {reconstruction_params['generated_points']:,} points")
+                        
+                        # Applica la stima in base all'algoritmo
+                        if engine == 'MCMC':
+                            # Per MCMC, usa la stima come cap_max (con un margine di sicurezza)
+                            original_cap_max = generated_params.final_params.get('cap_max', 800000)
+                            # Usa il minimo tra la stima (+20% margine) e il valore configurato
+                            generated_params.final_params['cap_max'] = min(
+                                int(estimated_gaussians * 1.2), 
+                                original_cap_max
+                            )
+                            print(f"🎯 MCMC cap_max set to: {generated_params.final_params['cap_max']:,}")
+                            
+                        elif engine == 'TAMING':
+                            # Per TAMING, usa la stima come budget (con un margine di sicurezza)
+                            original_budget = generated_params.final_params.get('budget', 1000000)
+                            # Usa il minimo tra la stima (+20% margine) e il valore configurato
+                            generated_params.final_params['budget'] = min(
+                                int(estimated_gaussians * 1.2), 
+                                original_budget
+                            )
+                            print(f"🎯 TAMING budget set to: {generated_params.final_params['budget']:,}")
+                    else:
+                        print(f"⚠️ No reconstruction params found, using default values")
+                        
+                except Exception as e:
+                    print(f"⚠️ Error estimating gaussians: {e}, using default values")
+                    # Continua con i valori di default se c'è un errore
+            
+
            # 📌 Aggiorna fase con i parametri di training PRIMA dell'esecuzione vera e propria
             model_service.update_phase(
                 model_id,

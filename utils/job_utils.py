@@ -49,7 +49,7 @@ class JobUtils:
             print(f"❌ No iteration folders found")
             return None
 
-    def get_colmap_reconstruction_stats(model_dir):
+    def get_colmap_reconstruction_stats(self,model_dir):
         """
         Raccoglie il numero di punti 3D dalla ricostruzione COLMAP
         """
@@ -80,3 +80,29 @@ class JobUtils:
                 pass
         
         return points_3d
+    
+    def estimate_final_gaussians(generated_points, avg_features=None, feature_consistency=None):
+        """
+        Formula ibrida che si adatta in base ai dati disponibili.
+        """
+        # Base: rapporto mediano più stabile
+        base_ratio = 16.5
+        
+        if avg_features is not None and feature_consistency is not None:
+            # Aggiustamento basato sulla complessità della scena
+            complexity_factor = 1.0
+            
+            # Scene con poche features tendono ad avere rapporti più alti
+            if avg_features < 5000:
+                complexity_factor *= 1.2
+            elif avg_features > 9000:
+                complexity_factor *= 0.9
+                
+            # Alta consistency (>0.5) = scene più semplici = rapporto più alto
+            if feature_consistency > 0.5:
+                complexity_factor *= (1 + (feature_consistency - 0.5) * 0.3)
+            
+            return int(generated_points * base_ratio * complexity_factor)
+        else:
+            # Fallback semplice
+            return int(generated_points * base_ratio)
