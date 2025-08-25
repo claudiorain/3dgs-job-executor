@@ -1,6 +1,8 @@
 import re
 import os
-
+from pathlib import Path
+import sqlite3
+import numpy as np
 
 
 class JobUtils:
@@ -81,28 +83,107 @@ class JobUtils:
         
         return points_3d
     
-    def estimate_final_gaussians(generated_points, avg_features=None, feature_consistency=None):
+    def get_avg_features_from_colmap_db(db_path: str) -> float | None:
         """
-        Formula ibrida che si adatta in base ai dati disponibili.
+        Restituisce il numero medio di keypoints per immagine dalla tabella 'keypoints'
+        del database COLMAP (database.db). Ritorna None se la query fallisce.
         """
-        # Base: rapporto mediano più stabile
-        base_ratio = 16.5
+        try:
+            con = sqlite3.connect(db_path)
+            cursor = con.cursor()
+            
+            # Analizza keypoints usando la struttura documentata COLMAP
+            # La tabella keypoints ha: image_id, rows, cols, data
+            cursor.execute("SELECT image_id, rows FROM keypoints WHERE data IS NOT NULL AND rows > 0")
+            keypoint_data = cursor.fetchall()
+
+            # Calcola statistiche delle feature (rows = numero di keypoints)
+            feature_counts = [int(row[1]) for row in keypoint_data if row[1] > 0]
+
+            avg_features = np.mean(feature_counts)
+            std_features = np.std(feature_counts)
+            feature_consistency = std_features / avg_features if avg_features > 0 else 1
+
+            con.close()
+            return int(avg_features) if avg_features is not None else None
+        except Exception:
+            return None
+    
+    def count_points_from_ply(ply_path: str) -> int:
+        """
+        Legge l'header del PLY e ritorna il numero di vertici (element vertex N).
+        Funziona sia per PLY ASCII che binari, perché il conteggio è nell'header.
+        """
+        p = Path(ply_path)
+        if not p.exists():
+            raise FileNotFoundError(f"PLY non trovato: {ply_path}")
+
+        n_vertices = None
+        with p.open("rb") as f:
+            # Leggi header riga per riga fino a 'end_header'
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    s = line.decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    s = ""
+                if s.startswith("element vertex"):
+                    parts = s.split()
+                    # atteso: ["element", "vertex", "<N>"]
+                    if len(parts) >= 3 and parts[2].isdigit():
+                        n_vertices = int(parts[2])
+                    else:
+                        # prova pars. più robusta
+                        try:
+                            n_vertices = int(parts[-1])
+                        except Exception:
+                            pass
+                if s == "end_header":
+                    break
+
+        if n_vertices is None:
+            raise ValueError("Impossibile determinare il numero di punti dal PLY (header senza 'element vertex N').")
+
+        return n_vertices
+    
+    def estimate_final_gaussians(
+    generated_points: int,
+    avg_features: float | None = None,
+    base_ratio: float = 16.5) -> tuple[int, float]:
+        """
+        Versione con smoothing morbido su avg_features.
+        - base_ratio: 16.5 (come fallback/ancora)
+        - Se avg_features è disponibile, applica un fattore di complessità in [0.9, 1.2]
+        mappando avg_features da [4000, 10000] -> [1.2, 0.9]
+        (scene povere di feature => +20%, ricche => -10%)
+        Ritorna: (stima_gaussiane, complexity_factor_usato)
+        """
+        if avg_features is None:
+            return int(generated_points * base_ratio), 1.0
+
+        lo, hi = 4000.0, 10000.0
+        x = max(lo, min(hi, float(avg_features)))
+        t = (x - lo) / (hi - lo)            # 0..1
+        complexity_factor = 1.2 * (1 - t) + 0.9 * t  # 1.2 -> 0.9
+
+        estimate = int(generated_points * base_ratio * complexity_factor)
+        return estimate, complexity_factor
         
-        if avg_features is not None and feature_consistency is not None:
-            # Aggiustamento basato sulla complessità della scena
-            complexity_factor = 1.0
-            
-            # Scene con poche features tendono ad avere rapporti più alti
-            if avg_features < 5000:
-                complexity_factor *= 1.2
-            elif avg_features > 9000:
-                complexity_factor *= 0.9
-                
-            # Alta consistency (>0.5) = scene più semplici = rapporto più alto
-            if feature_consistency > 0.5:
-                complexity_factor *= (1 + (feature_consistency - 0.5) * 0.3)
-            
-            return int(generated_points * base_ratio * complexity_factor)
-        else:
-            # Fallback semplice
-            return int(generated_points * base_ratio)
+    def list_image_files(input_dir: str, valid_ext):
+        """Ritorna solo i path delle immagini valide nella cartella indicata (non scende in /images)."""
+        p = Path(input_dir)
+        files = [
+            f for f in p.iterdir()
+            if f.is_file() and f.suffix.lower() in valid_ext
+        ]
+        return files
+
+    def safe_get(d: dict, *keys, default=None):
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict) or k not in cur:
+                return default
+            cur = cur[k]
+        return cur

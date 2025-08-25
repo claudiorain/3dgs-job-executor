@@ -107,7 +107,6 @@ class ModelService:
         :param additional_data: Dati aggiuntivi da salvare (es: thumbnail_s3_key, metadata, etc.)
         """
         current_time = datetime.utcnow()
-        
         update_fields = {
             "overall_status": overall_status,
             f"phases.{phase}.status": "COMPLETED",

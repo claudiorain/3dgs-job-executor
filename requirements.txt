@@ -8,5 +8,6 @@ pymediainfo
 sharp-frames
 scikit-image
 tqdm
+gradio
 # numpy, scipy, scikit-learn, opencv-python gestiti dal Dockerfile
 # SAM2 gestito dal Dockerfile con fallback

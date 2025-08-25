@@ -9,7 +9,7 @@ from models.training_params import (
 )
 from config.db import get_database
 from models.model import Engine  # Il tuo enum esistente
-
+import torch
 logger = logging.getLogger(__name__)
 
 # Mapping tra Engine e algorithm_name
@@ -195,26 +195,28 @@ class TrainingParamsService:
     # === METODI PRIVATI ===
     
     def _detect_gpu_memory(self) -> float:
-        """Auto-rileva VRAM GPU"""
+        """Auto-rileva VRAM GPU considerando limiti PyTorch"""
         try:
-            result = subprocess.run([
-                'nvidia-smi', 
-                '--query-gpu=memory.total', 
-                '--format=csv,noheader,nounits'
-            ], capture_output=True, text=True, timeout=10)
-            
-            if result.returncode == 0:
-                vram_mb = int(result.stdout.strip())
-                vram_gb = vram_mb / 1024
-                print(f"GPU VRAM rilevata: {vram_gb:.1f} GB")
-                return vram_gb
-            else:
-                logger.warning("Impossibile rilevare VRAM GPU, uso default 12GB")
-                return 12.0
+            if torch.cuda.is_available():
+                # 🎯 Usa PyTorch invece di nvidia-smi
+                device_props = torch.cuda.get_device_properties(0)
+                total_memory_gb = device_props.total_memory / 1e9
                 
+                # Controlla se c'è una fraction impostata
+                current_fraction = torch.cuda.get_per_process_memory_fraction(0)
+                available_memory_gb = total_memory_gb * current_fraction
+                
+                print(f"GPU VRAM fisica: {total_memory_gb:.1f} GB")
+                print(f"Fraction impostata: {current_fraction:.2f}")
+                print(f"VRAM disponibile PyTorch: {available_memory_gb:.1f} GB")
+                
+                return available_memory_gb
+            else:
+                return 12.0
+            
         except Exception as e:
-            logger.error(f"Errore rilevamento GPU: {e}, uso default 12GB")
-            return 12.0
+            logger.error(f"Errore rilevamento GPU: {e}, uso default 8GB")
+            return 8.0  # 🎯 Default a 8GB invece di 12GB
     
     def _apply_quality_transforms(
         self, 
