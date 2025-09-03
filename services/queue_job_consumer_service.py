@@ -13,14 +13,27 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 import tempfile
 from utils.phase_zip_helper import PhaseZipHelper
 from utils.job_utils import JobUtils
+from utils.point_cloud_utils import PointCloudUtils
 from utils.vram_monitor import VRAMMonitor  
 from plyfile import PlyData
+from services.gaussian_estimator_service import estimate_gaussians_from_stats
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 
 model_service = ModelService()
 repository_service = RepositoryService()
 training_params_service = TrainingParamsService()
 phase_zip_helper = PhaseZipHelper()
 job_utils = JobUtils()
+
+point_cloud_utils = PointCloudUtils()
 
 
 # Cartella per i file di staging (zip delle fasi)
@@ -359,19 +372,6 @@ class QueueJobService:
             colmap_duration = colmap_end_time - colmap_start_time
             colmap_duration_seconds = colmap_duration.total_seconds()
 
-            response_json = response.json()
-            reconstruction_params = response_json.get("reconstruction_params", {})
-            print(f"🔍 Extracted reconstruction_params: {reconstruction_params}")
-    
-
-            
-            # 🆕 RACCOGLI STATISTICHE COLMAP
-            reconstruction_params["generated_points"] = job_utils.get_colmap_reconstruction_stats(model_dir)
-    
-            print(f"🔍 Final reconstruction_params after adding generated_points: {reconstruction_params}")
-
-            
-                
             if response.status_code != 200:
                 self.fail(model_id,"point_cloud_building",f" Colmap error: {response.text}")
                 return False
@@ -384,12 +384,13 @@ class QueueJobService:
             print(f"✅ Nuvola di punti generata con successo per model_id {model_id}")
 
            
-            print(f"📊 COLMAP Stats: {reconstruction_params}")
 
             is_zip_uploaded = phase_zip_helper.create_phase_zip_and_upload(model_id,model_dir,TRAINING_PHASE_ZIP_NAME,['sparse', 'images'])
             if not is_zip_uploaded:
                 self.fail(model_id,"training",f"Error: Failed to create training phase ZIP for model_id {model_id}")
                 return False
+
+            reconstruction_params = point_cloud_utils.aggregate_reconstruction_stats(model_dir)
 
             frame_per_second = colmap_duration_seconds/frames_in
             thousand_points_per_second = colmap_duration_seconds/(reconstruction_params['generated_points']/1000)
@@ -504,35 +505,44 @@ class QueueJobService:
             training_start_time = datetime.utcnow()
             # 🆕 STIMA GAUSSIANE BASATA SUI PARAMETRI DI RICOSTRUZIONE
             if engine == 'MCMC' or engine == 'TAMING':
+                image_dir = os.path.join(model_dir, "images")
                 try:
                     # Estrai i parametri di ricostruzione dalla fase point_cloud_building
                     reconstruction_params = model.phases.get('point_cloud_building', {}).metadata['reconstruction_params']
                     
-                    if reconstruction_params and 'generated_points' in reconstruction_params:
+                    if reconstruction_params:
                         # Usa la formula semplice (più affidabile)
-                        estimated_gaussians = JobUtils.estimate_final_gaussians(reconstruction_params['generated_points'])
+                        res1 = estimate_gaussians_from_stats(reconstruction_params,
+                                                             image_dir,
+                                                             True,False,False,False,False, )
+                        res2 = estimate_gaussians_from_stats(reconstruction_params,image_dir,True,True,False,False,False )
+                        res3 = estimate_gaussians_from_stats(reconstruction_params,image_dir,True,True,True,False,False )
+                        res4 = estimate_gaussians_from_stats(reconstruction_params,image_dir,True,True,True,True, False  )
+                        res5 = estimate_gaussians_from_stats(reconstruction_params, image_dir)
+
+                        logger.info("Estimate debug:\n%s", json.dumps(res1, indent=2))
+                        logger.info("Estimate debug:\n%s", json.dumps(res2, indent=2))
+                        logger.info("Estimate debug:\n%s", json.dumps(res3, indent=2))
+                        logger.info("Estimate debug:\n%s", json.dumps(res4, indent=2))
+                        logger.info("Estimate debug:\n%s", json.dumps(res5, indent=2))
+                        suggested_params = res5['suggested_params']
+                        #estimated_gaussians = JobUtils.estimate_final_gaussians(reconstruction_params['generated_points'])
                         
-                        print(f"📊 Estimated gaussians: {estimated_gaussians:,} based on {reconstruction_params['generated_points']:,} points")
+                        logger.info("Suggested params:\n%s", json.dumps(suggested_params, indent=2))
+
                         
                         # Applica la stima in base all'algoritmo
                         if engine == 'MCMC':
                             # Per MCMC, usa la stima come cap_max (con un margine di sicurezza)
-                            original_cap_max = generated_params.final_params.get('cap_max', 1000000)
+                            #original_cap_max = generated_params.final_params.get('cap_max', suggested_params['cap_max'])
                             # Usa il minimo tra la stima (+20% margine) e il valore configurato
-                            generated_params.final_params['cap_max'] = max(
-                                int(estimated_gaussians * 1.2), 
-                                original_cap_max
-                            )
+                            generated_params.final_params['cap_max'] = suggested_params['cap_max']
                             print(f"🎯 MCMC cap_max set to: {generated_params.final_params['cap_max']:,}")
                             
                         elif engine == 'TAMING':
+                            generated_params.final_params['budget'] = suggested_params['budget']
                             # Per TAMING, usa la stima come budget (con un margine di sicurezza)
-                            original_budget = generated_params.final_params.get('budget', 1000000)
                             # Usa il minimo tra la stima (+20% margine) e il valore configurato
-                            generated_params.final_params['budget'] = max(
-                                int(estimated_gaussians * 1.2), 
-                                original_budget
-                            )
                             print(f"🎯 TAMING budget set to: {generated_params.final_params['budget']:,}")
                     else:
                         print(f"⚠️ No reconstruction params found, using default values")
@@ -546,6 +556,7 @@ class QueueJobService:
                 "input_dir": model_dir,
                 "output_dir": train_output_folder,
                 "params": generated_params.final_params,
+                "has_depths": True
             }
         
             # TRAIN API call

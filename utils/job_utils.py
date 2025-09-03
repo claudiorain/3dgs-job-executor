@@ -151,7 +151,7 @@ class JobUtils:
     def estimate_final_gaussians(
     generated_points: int,
     avg_features: float | None = None,
-    base_ratio: float = 16.5) -> tuple[int, float]:
+    base_ratio: float = 16.5) -> int:
         """
         Versione con smoothing morbido su avg_features.
         - base_ratio: 16.5 (come fallback/ancora)
@@ -161,7 +161,7 @@ class JobUtils:
         Ritorna: (stima_gaussiane, complexity_factor_usato)
         """
         if avg_features is None:
-            return int(generated_points * base_ratio), 1.0
+            return int(generated_points * base_ratio)
 
         lo, hi = 4000.0, 10000.0
         x = max(lo, min(hi, float(avg_features)))
@@ -169,7 +169,7 @@ class JobUtils:
         complexity_factor = 1.2 * (1 - t) + 0.9 * t  # 1.2 -> 0.9
 
         estimate = int(generated_points * base_ratio * complexity_factor)
-        return estimate, complexity_factor
+        return estimate
         
     def list_image_files(input_dir: str, valid_ext):
         """Ritorna solo i path delle immagini valide nella cartella indicata (non scende in /images)."""
